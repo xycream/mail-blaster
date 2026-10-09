@@ -23,10 +23,52 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Response
 from openpyxl import load_workbook
 
 app = FastAPI(title="Mail Blaster")
+
+
+# ── Access Password (anti-leak) ──
+# Set APP_PASSWORD env var (Railway) to require a password before ANY use.
+# Link leaks are harmless: anyone without the password cannot open or use the app.
+def _check_access(request: Request) -> bool:
+    """Return True if the request has valid access credentials."""
+    env_pass = os.environ.get("APP_PASSWORD")
+    if not env_pass:
+        return True  # no password configured → open access (local dev)
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Basic "):
+        import base64
+        try:
+            decoded = base64.b64decode(auth[6:]).decode("utf-8")
+            _, _, password = decoded.partition(":")
+            return password == env_pass
+        except Exception:
+            return False
+    return False
+
+
+def _deny(response_class=None):
+    """Return a 401 response that triggers the browser native password prompt."""
+    if response_class is JSONResponse:
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+    return Response(
+        status_code=401,
+        headers={"WWW-Authenticate": 'Basic realm="Mail Blaster", charset="UTF-8"'},
+    )
+
+
+@app.middleware("http")
+async def access_guard(request: Request, call_next):
+    """Protect every route: /, /api/*, uploads, everything."""
+    path = request.url.path
+    # Health check must stay open for Railway monitoring
+    if path == "/api/health":
+        return await call_next(request)
+    if not _check_access(request):
+        return _deny()
+    return await call_next(request)
 
 BASE_DIR = Path(__file__).parent
 
@@ -243,8 +285,15 @@ async def preview_variables(request: Request):
     """Preview which variables are available and a sample replacement."""
     body = await request.json()
     html = body.get("html", "")
+    round_params = body.get("round_params", {}) or {}
     if not excel_rows_cache:
         return JSONResponse({"ok": False, "error": "No Excel uploaded"}, status_code=400)
+    # Apply round-level fixed params first (same for all emails this round)
+    sample_html = html
+    for rp_name, rp_val in round_params.items():
+        if rp_val is None:
+            rp_val = ""
+        sample_html = sample_html.replace("{" + rp_name + "}", str(rp_val))
     # Find all {variable} in html
     import re
     variables = set(re.findall(r'\{(\w+)\}', html))
@@ -257,7 +306,6 @@ async def preview_variables(request: Request):
                 break
     # Build sample with first row
     sample_row = excel_rows_cache[0] if excel_rows_cache else []
-    sample_html = html
     for v, col_name in matched.items():
         col_idx = excel_columns_cache.index(col_name)
         val = sample_row[col_idx] if col_idx < len(sample_row) else ""
@@ -286,6 +334,7 @@ async def start_send(
     max_delay = int(body.get("max_delay", 10))
     test_mode = body.get("test_mode", False)
     test_email = body.get("test_email", "")
+    round_params = body.get("round_params", {}) or {}
     
     config = load_smtp_config()
     if not config:
@@ -310,6 +359,7 @@ async def start_send(
         "max_delay": max_delay,
         "test_mode": test_mode,
         "test_email": test_email,
+        "round_params": round_params,
         "config": config,
         "rows": [[str(c) if c is not None else "" for c in row] for row in excel_rows_cache],
         "headers": excel_columns_cache,
@@ -334,6 +384,7 @@ def _run_send_job(job_data):
     max_delay = job_data["max_delay"]
     test_mode = job_data["test_mode"]
     test_email = job_data["test_email"]
+    round_params = job_data.get("round_params", {}) or {}
     config = job_data["config"]
     rows = job_data["rows"]
     headers = job_data["headers"]
@@ -387,9 +438,18 @@ def _run_send_job(job_data):
             continue
         
         # Replace variables in subject and body
-        import re
+        # 1) First apply round-level fixed params (same for all emails this round)
         personalized_subject = subject
         personalized_html = html_body
+        for rp_name, rp_val in round_params.items():
+            if rp_val is None:
+                rp_val = ""
+            rp_val = str(rp_val)
+            personalized_subject = personalized_subject.replace("{" + rp_name + "}", rp_val)
+            personalized_html = personalized_html.replace("{" + rp_name + "}", rp_val)
+        
+        # 2) Then replace per-row Excel variables (overrides round params if same name)
+        import re
         for var_name, var_val in variables.items():
             personalized_subject = personalized_subject.replace("{" + var_name + "}", str(var_val))
             personalized_html = personalized_html.replace("{" + var_name + "}", str(var_val))
@@ -573,9 +633,29 @@ input[type=file]{margin-bottom:10px}
   </div>
 </div>
 
-<!-- Step 3: Email Content -->
+<!-- Step 3: Round Params (fixed for this batch, e.g. category/URL/picture) -->
+<div class="card" id="round-params-card">
+  <h2>3️⃣ 本轮统一参数 <span style="font-weight:normal;font-size:12px;color:#888;">(本批所有邮件一致，例如产品分类/链接/图片)</span></h2>
+  <div class="grid2">
+    <div>
+      <label>产品分类 <span class="snippet">{category_type}</span></label>
+      <input type="text" id="rp-category_type" placeholder="例如: Holiday Decor">
+    </div>
+    <div>
+      <label>产品链接 <span class="snippet">{product_url}</span></label>
+      <input type="text" id="rp-product_url" placeholder="https://...">
+    </div>
+  </div>
+  <div>
+    <label>产品图片 URL <span class="snippet">{picture_url}</span></label>
+    <input type="text" id="rp-picture_url" placeholder="https://你的CDN图片地址...">
+  </div>
+  <p class="hint">💡 这三个变量在本轮所有邮件中一致。如果 Excel 中有同名列，会以 Excel 行为准（更灵活）。</p>
+</div>
+
+<!-- Step 4: Email Content -->
 <div class="card">
-  <h2>3️⃣ 邮件内容 (HTML)</h2>
+  <h2>4️⃣ 邮件内容 (HTML)</h2>
   <label>邮件主题</label>
   <input type="text" id="subject" placeholder="Hi {handle}, TikTok Shop product opportunities from Liveology US" value="Hi {handle}, TikTok Shop product opportunities from Liveology US">
   <p class="hint">
@@ -611,7 +691,7 @@ input[type=file]{margin-bottom:10px}
 
 <!-- Step 4: Send Settings -->
 <div class="card">
-  <h2>4️⃣ 发送设置</h2>
+  <h2>5️⃣ 发送设置</h2>
   <div class="grid2">
     <div><label>最小间隔 (秒)</label><input type="number" id="min-delay" value="2"></div>
     <div><label>最大间隔 (秒)</label><input type="number" id="max-delay" value="10"></div>
@@ -625,7 +705,7 @@ input[type=file]{margin-bottom:10px}
 
 <!-- Step 5: Send -->
 <div class="card">
-  <h2>5️⃣ 发送</h2>
+  <h2>6️⃣ 发送</h2>
   <div style="display:flex;gap:10px;margin-bottom:12px;">
     <button class="btn btn-success" id="btn-send" onclick="startSend()">开始发送</button>
     <button class="btn btn-danger" id="btn-stop" onclick="stopSend()" disabled>停止</button>
@@ -652,16 +732,58 @@ input[type=file]{margin-bottom:10px}
 const DEFAULT_HTML = `<html>
 <body style="font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;font-size:14px;line-height:1.6;color:#333333;max-width:600px;margin:0 auto;padding:20px;">
 
-<p>Hi {handle},</p>
+<p style="margin-bottom:10px;">Hi {handle},</p>
 
-<p>I'm Luna from Liveology US, a TikTok Top Strategic Partner based in New York City.</p>
+<p style="margin-bottom:12px;">I'm Luna from Liveology US, a <strong>TikTok Top Strategic Partner</strong> based in New York City.</p>
 
-<p>Write your personalized email here. Use <code>{handle}</code>, <code>{name}</code>, <code>{email}</code> as variables.</p>
+<p style="margin-bottom:20px;">We're inviting selected TikTok creators to explore <strong>{category_type}</strong> products with free-sample and exclusive high-commission opportunities.</p>
+<!-- 产品图片：使用本轮统一参数 {picture_url}（在"3️⃣ 本轮统一参数"里填 CDN 图片地址） -->
+<p style="margin:0 0 6px 0;text-align:center;">
+  <img src="{picture_url}" alt="{category_type}" style="display:block;max-width:100%;width:100%;height:auto;border-radius:10px;border:1px solid #f0f0f0;">
+</p>
 
-<!-- Insert your image here: -->
-<!-- <img src="https://your-cdn.com/image.png" style="max-width:100%;border-radius:8px;"> -->
+<!-- 产品链接 -->
+<p style="margin:0 0 24px 0;text-align:center;">
+  <a href="{product_url}" style="color:#0066cc;text-decoration:underline;font-size:15px;">🔗 View the product</a>
+</p>
 
-<p>Best,<br>Luna Hei<br>Liveology US</p>
+<!-- 核心 Benefit 词组区 -->
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:20px;">
+  <tr><td style="background:#f8f9fa;border-radius:8px;padding:16px 20px;">
+    <p style="margin:0 0 10px 0;"><strong>What's in it for you:</strong></p>
+    <p style="margin:0 0 6px 0;">💯 <strong>100% FREE</strong> sample</p>
+    <p style="margin:0 0 6px 0;">📦 Keep the product — it's yours</p>
+    <p style="margin:0 0 6px 0;">💰 Earn <strong>high commission</strong> on every sale</p>
+    <p style="margin:0 0 0 0;">🎥 Perfect content for your audience</p>
+  </td></tr>
+</table>
+
+<!-- 3 步行动 -->
+<p style="margin:0 0 10px 0;"><strong>Claim in 3 steps:</strong></p>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:20px;">
+  <tr><td style="background:#ffffff;border:2px solid #f0f0f0;border-radius:8px;padding:14px 20px;">
+    <p style="margin:0 0 4px 0;">1️⃣ Click the link</p>
+    <p style="margin:0 0 4px 0;">2️⃣ Browse the picks</p>
+    <p style="margin:0 0 0 0;">3️⃣ Apply for free samples</p>
+  </td></tr>
+</table>
+
+<!-- CTA 按钮（改颜色适配品牌色） -->
+<p style="margin:0 0 24px 0;text-align:center;">
+  <a href="{product_url}" style="display:inline-block;background:#DC1F26;color:#ffffff;padding:14px 32px;border-radius:6px;text-decoration:none;font-weight:bold;font-size:16px;">👉 Claim My FREE Sample</a>
+</p>
+
+<p style="margin:0 0 8px 0;color:#666666;">Want more opportunities like this? Reply <strong>1</strong> — we'll send weekly updates.</p>
+<p style="margin:0 0 20px 0;color:#666666;">You can opt out anytime.</p>
+
+<p style="margin:0 0 20px 0;">Looking forward to working with you!</p>
+
+<p style="margin:0;">Best,<br>
+Luna Hei<br>
+Liveology US<br>
+NYC Office<br>
+1350 Avenue of the Americas, Floor 2<br>
+New York, NY 10019</p>
 
 </body>
 </html>`;
@@ -876,7 +998,8 @@ async function setEmailColumn() {
 // ── Variable Preview ──
 async function previewVariables() {
   const html = getEditorHtml();
-  const d = await api('/api/preview_variables', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({html})});
+  const rp = collectRoundParams();
+  const d = await api('/api/preview_variables', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({html, round_params: rp})});
   const box = document.getElementById('var-preview');
   if (d.ok) {
     box.style.display = 'block';
@@ -897,6 +1020,15 @@ async function previewVariables() {
 // ── Send ──
 let pollTimer = null;
 
+function collectRoundParams() {
+  const params = {};
+  ['category_type', 'product_url', 'picture_url'].forEach(key => {
+    const el = document.getElementById('rp-' + key);
+    if (el && el.value.trim()) params[key] = el.value.trim();
+  });
+  return params;
+}
+
 async function startSend() {
   const subject = document.getElementById('subject').value;
   const html = getEditorHtml();
@@ -916,6 +1048,7 @@ async function startSend() {
     max_delay: parseInt(document.getElementById('max-delay').value),
     test_mode: testMode,
     test_email: testEmail,
+    round_params: collectRoundParams(),
   };
   
   const d = await api('/api/send', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});

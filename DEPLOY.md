@@ -59,6 +59,7 @@ Mail Blaster service → **Variables** → 逐个填入：
 | `SMTP_USERNAME` | `liveology.ny@gmail.com` | 发件邮箱 |
 | `SMTP_PASSWORD` | `你的16位App Password` | Gmail App Password（不是登录密码）|
 | `SENDER_NAME` | `Luna Hei` | 收件人看到的发件人 |
+| `APP_PASSWORD` | `你自己设的访问密码` | **🔒 链接防泄漏门禁**（必填，见下方说明）|
 | `PORT` | Railway 自动设置 | 不要手动改 |
 
 ⚠️ **绝对不要**把 `SMTP_PASSWORD` 写到代码里或者 commit 到 Git。
