@@ -399,7 +399,26 @@ def _run_send_job(job_data):
     sent = 0
     failed = 0
     log = []
-    
+
+    # Reusable SMTP connection (avoid re-auth per email, which Gmail throttles on datacenter IPs)
+    smtp_conn = None
+
+    def _get_smtp():
+        nonlocal smtp_conn
+        if smtp_conn is None:
+            smtp_conn = smtplib.SMTP_SSL(config["host"], config["port"], timeout=120)
+            smtp_conn.login(config["username"], config["password"])
+        return smtp_conn
+
+    def _close_smtp():
+        nonlocal smtp_conn
+        if smtp_conn is not None:
+            try:
+                smtp_conn.quit()
+            except Exception:
+                pass
+            smtp_conn = None
+
     _save_state({
         "status": "running",
         "total": total,
@@ -410,29 +429,85 @@ def _run_send_job(job_data):
         "started_at": datetime.now().isoformat(),
     })
     
-    for idx, row in enumerate(rows):
-        if _stop_flag.is_set():
-            _save_state({
-                "status": "stopped",
-                "total": total,
-                "sent": sent,
-                "failed": failed,
-                "current_row": idx,
-                "log": log[-100:],
-            })
-            return
-        
-        # Build variable map
-        variables = {}
-        for i, h in enumerate(headers):
-            variables[h] = row[i] if i < len(row) else ""
-        
-        # Get recipient
-        recipient = test_email if test_mode and test_email else (row[email_col] if email_col < len(row) else "")
-        
-        if not recipient or "@" not in str(recipient):
-            failed += 1
-            log.append({"row": idx + 1, "email": str(recipient), "ok": False, "error": "No valid email"})
+    try:
+        for idx, row in enumerate(rows):
+            if _stop_flag.is_set():
+                break
+
+            # Build variable map
+            variables = {}
+            for i, h in enumerate(headers):
+                variables[h] = row[i] if i < len(row) else ""
+
+            # Get recipient
+            recipient = test_email if test_mode and test_email else (row[email_col] if email_col < len(row) else "")
+
+            if not recipient or "@" not in str(recipient):
+                failed += 1
+                log.append({"row": idx + 1, "email": str(recipient), "ok": False, "error": "No valid email"})
+                _save_state({
+                    "status": "running",
+                    "total": total,
+                    "sent": sent,
+                    "failed": failed,
+                    "current_row": idx + 1,
+                    "log": log[-100:],
+                })
+                continue
+
+            # Replace variables in subject and body
+            # 1) First apply round-level fixed params (same for all emails this round)
+            personalized_subject = subject
+            personalized_html = html_body
+            for rp_name, rp_val in round_params.items():
+                if rp_val is None:
+                    rp_val = ""
+                rp_val = str(rp_val)
+                personalized_subject = personalized_subject.replace("{" + rp_name + "}", rp_val)
+                personalized_html = personalized_html.replace("{" + rp_name + "}", rp_val)
+
+            # 2) Then replace per-row Excel variables (overrides round params if same name)
+            import re
+            for var_name, var_val in variables.items():
+                personalized_subject = personalized_subject.replace("{" + var_name + "}", str(var_val))
+                personalized_html = personalized_html.replace("{" + var_name + "}", str(var_val))
+
+            # Also replace {name} with email prefix if not in columns
+            if "{name}" in personalized_html and "name" not in headers:
+                name_part = str(recipient).split("@")[0]
+                personalized_html = personalized_html.replace("{name}", name_part)
+            if "{name}" in personalized_subject and "name" not in headers:
+                name_part = str(recipient).split("@")[0]
+                personalized_subject = personalized_subject.replace("{name}", name_part)
+
+            # Send email with connection reuse + retry (up to 3 attempts)
+            ok = False
+            last_err = ""
+            for attempt in range(3):
+                try:
+                    srv = _get_smtp()
+                    msg = EmailMessage()
+                    msg["From"] = formataddr((from_name or "", config["username"]))
+                    msg["To"] = recipient
+                    msg["Subject"] = personalized_subject
+                    msg.set_content("Please enable HTML to view this email.")
+                    msg.add_alternative(personalized_html, subtype="html")
+                    srv.send_message(msg)
+                    ok = True
+                    break
+                except Exception as e:
+                    last_err = str(e)
+                    # Connection may be dead: close and reconnect on next attempt
+                    _close_smtp()
+                    time.sleep(2)
+
+            if ok:
+                sent += 1
+                log.append({"row": idx + 1, "email": recipient, "ok": True, "error": ""})
+            else:
+                failed += 1
+                log.append({"row": idx + 1, "email": recipient, "ok": False, "error": last_err})
+
             _save_state({
                 "status": "running",
                 "total": total,
@@ -441,66 +516,14 @@ def _run_send_job(job_data):
                 "current_row": idx + 1,
                 "log": log[-100:],
             })
-            continue
-        
-        # Replace variables in subject and body
-        # 1) First apply round-level fixed params (same for all emails this round)
-        personalized_subject = subject
-        personalized_html = html_body
-        for rp_name, rp_val in round_params.items():
-            if rp_val is None:
-                rp_val = ""
-            rp_val = str(rp_val)
-            personalized_subject = personalized_subject.replace("{" + rp_name + "}", rp_val)
-            personalized_html = personalized_html.replace("{" + rp_name + "}", rp_val)
-        
-        # 2) Then replace per-row Excel variables (overrides round params if same name)
-        import re
-        for var_name, var_val in variables.items():
-            personalized_subject = personalized_subject.replace("{" + var_name + "}", str(var_val))
-            personalized_html = personalized_html.replace("{" + var_name + "}", str(var_val))
-        
-        # Also replace {name} with email prefix if not in columns
-        if "{name}" in personalized_html and "name" not in headers:
-            name_part = str(recipient).split("@")[0]
-            personalized_html = personalized_html.replace("{name}", name_part)
-        if "{name}" in personalized_subject and "name" not in headers:
-            name_part = str(recipient).split("@")[0]
-            personalized_subject = personalized_subject.replace("{name}", name_part)
-        
-        # Send email
-        try:
-            msg = EmailMessage()
-            msg["From"] = formataddr((from_name or "", config["username"]))
-            msg["To"] = recipient
-            msg["Subject"] = personalized_subject
-            msg.set_content("Please enable HTML to view this email.")
-            msg.add_alternative(personalized_html, subtype="html")
-            
-            with smtplib.SMTP_SSL(config["host"], config["port"], timeout=30) as srv:
-                srv.login(config["username"], config["password"])
-                srv.send_message(msg)
-            
-            sent += 1
-            log.append({"row": idx + 1, "email": recipient, "ok": True, "error": ""})
-        except Exception as e:
-            failed += 1
-            log.append({"row": idx + 1, "email": recipient, "ok": False, "error": str(e)})
-        
-        _save_state({
-            "status": "running",
-            "total": total,
-            "sent": sent,
-            "failed": failed,
-            "current_row": idx + 1,
-            "log": log[-100:],
-        })
-        
-        # Random delay (skip after last email)
-        if idx < total - 1 and not _stop_flag.is_set():
-            delay = random.uniform(min_delay, max_delay)
-            time.sleep(delay)
-    
+
+            # Random delay (skip after last email)
+            if idx < total - 1 and not _stop_flag.is_set():
+                delay = random.uniform(min_delay, max_delay)
+                time.sleep(delay)
+    finally:
+        _close_smtp()
+
     final_status = "completed" if not _stop_flag.is_set() else "stopped"
     _save_state({
         "status": final_status,
