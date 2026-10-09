@@ -679,7 +679,7 @@ input[type=file]{margin-bottom:10px}
   <div class="grid2">
     <div>
       <label>产品链接 <span class="snippet">{product_url}</span></label>
-      <input type="text" id="rp-product_url" placeholder="https://...">
+      <input type="text" id="rp-product_url" placeholder="Taplink / TikTok Shop 产品页 / 官网链接">
     </div>
     <div>
       <label>产品价格 <span class="snippet">{product_price}</span></label>
