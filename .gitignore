@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+
+# Data / uploads (will be persisted via Railway Volume)
+uploads/
+data/
+*.xlsx
+*.xls
+*.csv
+*.log
+
+# Secrets
+.smtp_config.json
+.env
+.env.local
+
+# Service
+.service/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
