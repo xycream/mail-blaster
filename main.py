@@ -662,24 +662,34 @@ input[type=file]{margin-bottom:10px}
   </div>
 </div>
 
-<!-- Step 3: Round Params (fixed for this batch, e.g. category/URL/picture) -->
+<!-- Step 3: Round Params (fixed for this batch) -->
 <div class="card" id="round-params-card">
-  <h2>3️⃣ 本轮统一参数 <span style="font-weight:normal;font-size:12px;color:#888;">(本批所有邮件一致，例如产品分类/链接/图片)</span></h2>
+  <h2>3️⃣ 本轮统一参数 <span style="font-weight:normal;font-size:12px;color:#888;">(本批所有邮件一致，按需填写)</span></h2>
+  <p class="hint">💡 有需要就填，不需要的留空即可（留空的变量会被替换成空字符串，不影响其他内容）。</p>
   <div class="grid2">
     <div>
       <label>产品分类 <span class="snippet">{category_type}</span></label>
-      <input type="text" id="rp-category_type" placeholder="例如: Holiday Decor">
+      <input type="text" id="rp-category_type" placeholder="例如: Christmas Light Strip">
     </div>
+    <div>
+      <label>品牌名称 <span class="snippet">{brand_name}</span></label>
+      <input type="text" id="rp-brand_name" placeholder="例如: Eufy">
+    </div>
+  </div>
+  <div class="grid2">
     <div>
       <label>产品链接 <span class="snippet">{product_url}</span></label>
       <input type="text" id="rp-product_url" placeholder="https://...">
+    </div>
+    <div>
+      <label>产品价格 <span class="snippet">{product_price}</span></label>
+      <input type="text" id="rp-product_price" placeholder="例如: $199">
     </div>
   </div>
   <div>
     <label>产品图片 URL <span class="snippet">{picture_url}</span></label>
     <input type="text" id="rp-picture_url" placeholder="https://你的CDN图片地址...">
   </div>
-  <p class="hint">💡 这三个变量在本轮所有邮件中一致。如果 Excel 中有同名列，会以 Excel 行为准（更灵活）。</p>
 </div>
 
 <!-- Step 4: Email Content -->
@@ -1051,7 +1061,7 @@ let pollTimer = null;
 
 function collectRoundParams() {
   const params = {};
-  ['category_type', 'product_url', 'picture_url'].forEach(key => {
+  ['category_type', 'brand_name', 'product_url', 'picture_url', 'product_price'].forEach(key => {
     const el = document.getElementById('rp-' + key);
     if (el && el.value.trim()) params[key] = el.value.trim();
   });
