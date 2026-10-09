@@ -49,10 +49,8 @@ def _check_access(request: Request) -> bool:
     return False
 
 
-def _deny(response_class=None):
+def _deny():
     """Return a 401 response that triggers the browser native password prompt."""
-    if response_class is JSONResponse:
-        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
     return Response(
         status_code=401,
         headers={"WWW-Authenticate": 'Basic realm="Mail Blaster", charset="UTF-8"'},
@@ -168,53 +166,61 @@ excel_path_cache = None
 @app.post("/api/upload_excel")
 async def upload_excel(file: UploadFile = File(...)):
     global excel_columns_cache, excel_rows_cache, excel_path_cache
-    
+
+    # Sanitize filename: strip path components to prevent path traversal
+    safe_name = os.path.basename(file.filename or "upload.xlsx")
+    if not safe_name:
+        return JSONResponse({"ok": False, "error": "Invalid filename"}, status_code=400)
+    # Add timestamp prefix to avoid collisions
+    save_path = UPLOAD_DIR / f"{int(time.time())}_{safe_name}"
+
     # Save file
-    save_path = UPLOAD_DIR / file.filename
     with open(save_path, "wb") as f:
         f.write(await file.read())
-    
-    # Parse
+
+    # Parse (workbook is always closed via finally to avoid file handle leak)
     wb = load_workbook(save_path, read_only=True, data_only=True)
-    ws = wb.active
-    rows = list(ws.iter_rows(values_only=True))
-    if not rows:
-        return JSONResponse({"ok": False, "error": "Empty Excel"}, status_code=400)
-    
-    headers = [str(h).strip() if h else f"col_{i+1}" for i, h in enumerate(rows[0])]
-    
-    # Find email column
-    email_col = None
-    for i, h in enumerate(headers):
-        if "email" in h.lower() or "邮箱" in h or "mail" in h.lower():
-            email_col = i
-            break
-    
-    if email_col is None:
-        # Return columns for manual selection
+    try:
+        ws = wb.active
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            return JSONResponse({"ok": False, "error": "Empty Excel"}, status_code=400)
+
+        headers = [str(h).strip() if h else f"col_{i+1}" for i, h in enumerate(rows[0])]
+
+        # Find email column
+        email_col = None
+        for i, h in enumerate(headers):
+            if "email" in h.lower() or "邮箱" in h or "mail" in h.lower():
+                email_col = i
+                break
+
+        if email_col is None:
+            # Return columns for manual selection
+            excel_columns_cache = headers
+            excel_rows_cache = rows[1:]
+            excel_path_cache = str(save_path)
+            return JSONResponse({
+                "ok": True,
+                "headers": headers,
+                "row_count": len(rows) - 1,
+                "email_column": None,
+                "needs_column_select": True,
+            })
+
         excel_columns_cache = headers
         excel_rows_cache = rows[1:]
         excel_path_cache = str(save_path)
         return JSONResponse({
             "ok": True,
             "headers": headers,
+            "email_column": email_col,
+            "email_column_name": headers[email_col],
             "row_count": len(rows) - 1,
-            "email_column": None,
-            "needs_column_select": True,
+            "needs_column_select": False,
         })
-    
-    excel_columns_cache = headers
-    excel_rows_cache = rows[1:]
-    excel_path_cache = str(save_path)
-    wb.close()
-    return JSONResponse({
-        "ok": True,
-        "headers": headers,
-        "email_column": email_col,
-        "email_column_name": headers[email_col],
-        "row_count": len(rows) - 1,
-        "needs_column_select": False,
-    })
+    finally:
+        wb.close()
 
 
 @app.post("/api/set_email_column")
@@ -689,7 +695,7 @@ input[type=file]{margin-bottom:10px}
   <div id="var-preview" style="margin-top:8px;border:1px solid #eee;border-radius:6px;padding:12px;display:none;"></div>
 </div>
 
-<!-- Step 4: Send Settings -->
+<!-- Step 5: Send Settings -->
 <div class="card">
   <h2>5️⃣ 发送设置</h2>
   <div class="grid2">
@@ -703,7 +709,7 @@ input[type=file]{margin-bottom:10px}
   </div>
 </div>
 
-<!-- Step 5: Send -->
+<!-- Step 6: Send -->
 <div class="card">
   <h2>6️⃣ 发送</h2>
   <div style="display:flex;gap:10px;margin-bottom:12px;">
@@ -1082,14 +1088,20 @@ async function updateProgress() {
   const pct = d.total > 0 ? ((d.sent + d.failed) / d.total * 100) : 0;
   document.getElementById('progress-fill').style.width = pct + '%';
   
-  // Log
+  // Log (use textContent via DOM construction to avoid XSS from email/error fields)
   const lb = document.getElementById('log-box');
+  lb.textContent = '';
   const log = d.log || [];
-  lb.innerHTML = log.slice(-20).map(e =>
-    '<div class="log-line ' + (e.ok ? 'log-ok' : 'log-fail') + '">' +
-    'Row ' + e.row + ' · ' + e.email + ' · ' + (e.ok ? '✅' : '❌ ' + e.error) +
-    '</div>'
-  ).join('');
+  log.slice(-20).forEach(e => {
+    const div = document.createElement('div');
+    div.className = 'log-line ' + (e.ok ? 'log-ok' : 'log-fail');
+    const parts = ['Row ' + e.row, e.email, e.ok ? '✅' : '❌ ' + (e.error || '')];
+    parts.forEach((p, i) => {
+      if (i > 0) div.appendChild(document.createTextNode(' · '));
+      div.appendChild(document.createTextNode(String(p)));
+    });
+    lb.appendChild(div);
+  });
   lb.scrollTop = lb.scrollHeight;
   
   // Status check
