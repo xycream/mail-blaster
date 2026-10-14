@@ -608,6 +608,11 @@ input[type=file]{margin-bottom:10px}
 .image-thumb img{width:100%;height:70px;object-fit:cover;border-radius:4px;display:block;margin-bottom:4px}
 .image-thumb .name{font-size:11px;color:#6b7280;word-break:break-all}
 
+/* Image delete button (top-right corner of thumbnail) */
+.img-del-btn{position:absolute;top:2px;right:2px;width:22px;height:22px;border:none;border-radius:50%;background:rgba(0,0,0,0.55);color:#fff;font-size:12px;line-height:22px;text-align:center;cursor:pointer;padding:0;opacity:0;transition:opacity 0.15s}
+.image-thumb:hover .img-del-btn{opacity:1}
+.img-del-btn:hover{background:#dc3545}
+
 .stats{display:flex;gap:20px;margin:12px 0}
 .stat{text-align:center;padding:10px 20px;border-radius:8px;background:#f8f9fa}
 .stat .num{font-size:24px;font-weight:700}
@@ -747,7 +752,7 @@ input[type=file]{margin-bottom:10px}
   <h2>6️⃣ 发送</h2>
   <div style="display:flex;gap:10px;margin-bottom:12px;">
     <button class="btn btn-success" id="btn-send" onclick="startSend()">开始发送</button>
-    <button class="btn btn-danger" id="btn-stop" onclick="stopSend()" disabled>停止</button>
+    <button class="btn btn-danger" id="btn-stop" onclick="stopSend()">🛑 停止</button>
   </div>
   
   <div class="stats">
@@ -914,7 +919,30 @@ function addImageToGallery(name, url) {
   const gallery = document.getElementById('image-gallery');
   const div = document.createElement('div');
   div.className = 'image-thumb';
-  div.innerHTML = `<img src="${url}" alt="${name}"><div class="name">${name}</div>`;
+  div.style.position = 'relative';
+
+  // Build DOM safely (no innerHTML to avoid XSS from name/url)
+  const img = document.createElement('img');
+  img.src = url;
+  img.alt = name;
+  const nameDiv = document.createElement('div');
+  nameDiv.className = 'name';
+  nameDiv.textContent = name;
+  const delBtn = document.createElement('button');
+  delBtn.className = 'img-del-btn';
+  delBtn.textContent = '✕';
+  delBtn.title = '从图片库删除';
+  delBtn.onclick = (ev) => {
+    ev.stopPropagation();  // don't trigger insert
+    if (confirm(`确认从图片库删除「${name}」吗？\n（已插入编辑器的内容不受影响）`)) {
+      div.remove();
+    }
+  };
+  div.appendChild(img);
+  div.appendChild(nameDiv);
+  div.appendChild(delBtn);
+
+  // Click thumbnail → insert into editor
   div.onclick = () => {
     const imgTag = `<img src="${url}" alt="${name}" style="max-width:100%;border-radius:8px;margin:8px 0;">`;
     const cursor = editor.getCursor();
@@ -1093,7 +1121,7 @@ async function startSend() {
   const d = await api('/api/send', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
   if (d.ok) {
     document.getElementById('btn-send').disabled = true;
-    document.getElementById('btn-stop').disabled = false;
+    // btn-stop stays enabled always (user can stop anytime)
     startPolling();
   } else {
     alert('❌ ' + (d.error||'发送失败'));
@@ -1101,8 +1129,20 @@ async function startSend() {
 }
 
 async function stopSend() {
-  await api('/api/stop', {method:'POST'});
-  alert('停止请求已发送，正在等待当前邮件发完...');
+  // Always clickable: even if frontend thinks job is idle, backend may still be running
+  const btn = document.getElementById('btn-stop');
+  btn.disabled = true;
+  btn.textContent = '停止中...';
+  try {
+    await api('/api/stop', {method:'POST'});
+    // Immediate feedback, no blocking alert (so UI can keep polling)
+    btn.textContent = '停止请求已发出';
+    setTimeout(() => { btn.textContent = '停止'; btn.disabled = false; }, 2000);
+  } catch (e) {
+    btn.textContent = '停止';
+    btn.disabled = false;
+    alert('❌ 停止请求失败，请重试');
+  }
 }
 
 function startPolling() {
@@ -1140,7 +1180,6 @@ async function updateProgress() {
   // Status check
   if (d.status && d.status !== 'running' && d.status !== 'idle') {
     document.getElementById('btn-send').disabled = false;
-    document.getElementById('btn-stop').disabled = true;
     if (d.status === 'completed') {
       if (pollTimer) clearInterval(pollTimer);
     }
@@ -1150,6 +1189,16 @@ async function updateProgress() {
 // ── Test mode toggle ──
 document.getElementById('test-mode').addEventListener('change', function() {
   document.getElementById('test-email-box').style.display = this.checked ? 'block' : 'none';
+});
+
+// ── Warn before closing page while sending ──
+window.addEventListener('beforeunload', function(e) {
+  // Check current UI state: send button disabled = job in progress
+  if (document.getElementById('btn-send').disabled) {
+    e.preventDefault();
+    e.returnValue = '⚠️ 邮件正在发送中，关闭页面将中断任务。确定要离开吗？';
+    return e.returnValue;
+  }
 });
 
 // ── Init ──
