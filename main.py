@@ -707,13 +707,11 @@ input[type=file]{margin-bottom:10px}
     <span class="snippet">{"{"}handle{"}"}</span> / <span class="snippet">{"{"}name{"}"}</span> / <span class="snippet">{"{"}email{"}"}</span> 等
   </p>
 
-  <!-- Image gallery (uploaded images for click-to-insert) -->
+  <!-- Image gallery (add images by URL, click-to-insert) -->
   <div style="margin-bottom:8px;">
     <label style="display:inline;">图片库 (点缩略图插入)</label>
-    <input type="file" id="inline-image-file" accept="image/*" style="display:inline-block;margin-left:8px;margin-bottom:0;width:auto;">
-    <button class="btn btn-secondary" style="padding:4px 10px;font-size:12px;" onclick="uploadInlineImage()">上传并转 base64</button>
     <br>
-    <input type="text" id="image-url-input" placeholder="或粘贴图片 CDN URL —— https://..." style="display:inline-block;margin-top:6px;width:380px;margin-bottom:6px;">
+    <input type="text" id="image-url-input" placeholder="粘贴图片 CDN URL —— https://..." style="display:inline-block;margin-top:6px;width:380px;margin-bottom:6px;">
     <button class="btn btn-secondary" style="padding:4px 10px;font-size:12px;" onclick="addImageByUrl()">+ 通过 URL 添加</button>
     <div id="image-gallery" class="image-gallery"></div>
   </div>
@@ -898,23 +896,7 @@ function formatHtml() {
   }
 }
 
-// ── Image upload (converts to base64 for inline embed) ──
-async function uploadInlineImage() {
-  const f = document.getElementById('inline-image-file').files[0];
-  if (!f) { alert('请选择图片'); return; }
-  // Convert to base64
-  const reader = new FileReader();
-  reader.onload = function(e) {
-    const dataUrl = e.target.result;
-    addImageToGallery(f.name, dataUrl);
-    // Auto-insert into editor
-    const imgTag = `<img src="${dataUrl}" alt="${f.name}" style="max-width:100%;border-radius:8px;margin:8px 0;">`;
-    const cursor = editor.getCursor();
-    editor.replaceRange('\n' + imgTag + '\n', cursor);
-  };
-  reader.readAsDataURL(f);
-}
-
+// ── Image library (URL only; base64 removed because Gmail does not render data-URI images) ──
 function addImageToGallery(name, url) {
   const gallery = document.getElementById('image-gallery');
   const div = document.createElement('div');
