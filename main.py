@@ -80,6 +80,31 @@ JOB_STATE_FILE = Path(os.environ.get("JOB_STATE_FILE", str(BASE_DIR / "data" / "
 JOB_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 
+def _open_smtp(host, port, timeout=60):
+    """Open an SMTP connection: implicit SSL (typically 465) or STARTTLS (587/25)."""
+    port = int(port)
+    if port == 465:
+        return smtplib.SMTP_SSL(host, port, timeout=timeout)
+    srv = smtplib.SMTP(host, port, timeout=timeout)
+    srv.ehlo()
+    if srv.has_extn("starttls"):
+        import ssl
+        ctx = ssl.create_default_context()
+        srv.starttls(context=ctx)
+        srv.ehlo()
+    return srv
+
+
+def _diagnose_smtp_targets():
+    """Candidate SMTP endpoints to probe for Lark/Feishu mailboxes."""
+    return [
+        ("smtp.larksuite.com", 465),
+        ("smtp.larksuite.com", 587),
+        ("smtp.feishu.cn", 465),
+        ("smtp.feishu.cn", 587),
+    ]
+
+
 def _load_smtp_from_env():
     """Load SMTP config from environment variables (used on Railway/Heroku/etc.)."""
     host = os.environ.get("SMTP_HOST")
@@ -301,7 +326,7 @@ async def smtp_configure(
     config = save_smtp_config(host, port, username, password, sender_name)
     # Test connection
     try:
-        with smtplib.SMTP_SSL(config["host"], config["port"], timeout=10) as srv:
+        with _open_smtp(config["host"], config["port"], timeout=25) as srv:
             srv.login(config["username"], config["password"])
         return JSONResponse({"ok": True, "message": "SMTP connected successfully", "connected": True})
     except Exception as e:
@@ -481,7 +506,7 @@ def _run_send_job(job_data):
     def _get_smtp():
         nonlocal smtp_conn
         if smtp_conn is None:
-            smtp_conn = smtplib.SMTP_SSL(config["host"], config["port"], timeout=120)
+            smtp_conn = _open_smtp(config["host"], config["port"], timeout=120)
             smtp_conn.login(config["username"], config["password"])
         return smtp_conn
 
@@ -685,6 +710,37 @@ async def search_excel(request: Request):
             wb.close()
 
     return JSONResponse({"ok": True, "query": query, "matches": results})
+
+
+@app.post("/api/smtp/diag")
+async def smtp_diag():
+    """
+    Probe SMTP endpoints from THIS server's network (shows which ports are reachable
+    from the deployment environment — useful when a provider blocks SMTP egress).
+    Connectivity + banner only; does NOT send email.
+    """
+    results = []
+    for host, port in _diagnose_smtp_targets():
+        entry = {"host": host, "port": port, "connect": None, "banner": None, "error": None}
+        try:
+            if port == 465:
+                srv = smtplib.SMTP_SSL(host, port, timeout=20)
+            else:
+                srv = smtplib.SMTP(host, port, timeout=20)
+            code, msg = srv.ehlo()
+            entry["connect"] = f"OK (EHLO {code})"
+            entry["banner"] = (msg or b"").decode(errors="replace")[:120]
+            entry["starttls_available"] = srv.has_extn("starttls")
+            entry["auth_available"] = srv.has_extn("auth")
+            try:
+                srv.quit()
+            except Exception:
+                pass
+        except Exception as e:
+            entry["connect"] = "FAILED"
+            entry["error"] = f"{type(e).__name__}: {str(e)[:100]}"
+        results.append(entry)
+    return JSONResponse({"ok": True, "server_time": datetime.now().isoformat(), "targets": results})
 
 
 @app.post("/api/stop")
