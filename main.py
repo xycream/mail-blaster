@@ -105,6 +105,29 @@ def _diagnose_smtp_targets():
     ]
 
 
+def _diagnose_https_targets():
+    """Fixed allowlist of Lark Open API hosts (443). Used to verify the HTTP API
+    path is reachable from this server's network before building on it."""
+    return [
+        "https://open.larksuite.com",
+        "https://open.feishu.cn",
+    ]
+
+
+def _probe_https(url, timeout=20):
+    """GET a fixed allowlisted URL; report reachability only (no data exfil)."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, method="GET", headers={"User-Agent": "smtp-diag/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return {"url": url, "connect": "OK", "http_status": resp.status}
+    except Exception as e:
+        status = getattr(e, "code", None)
+        if status:  # HTTP error still proves the host is reachable
+            return {"url": url, "connect": "OK", "http_status": status}
+        return {"url": url, "connect": "FAILED", "error": f"{type(e).__name__}: {str(e)[:100]}"}
+
+
 def _load_smtp_from_env():
     """Load SMTP config from environment variables (used on Railway/Heroku/etc.)."""
     host = os.environ.get("SMTP_HOST")
@@ -740,7 +763,13 @@ async def smtp_diag():
             entry["connect"] = "FAILED"
             entry["error"] = f"{type(e).__name__}: {str(e)[:100]}"
         results.append(entry)
-    return JSONResponse({"ok": True, "server_time": datetime.now().isoformat(), "targets": results})
+    https_results = [_probe_https(u) for u in _diagnose_https_targets()]
+    return JSONResponse({
+        "ok": True,
+        "server_time": datetime.now().isoformat(),
+        "targets": results,
+        "lark_api_reachable": https_results,
+    })
 
 
 @app.post("/api/stop")
