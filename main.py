@@ -157,15 +157,49 @@ def get_state():
     return s
 
 
+# ── Upload History (persisted to volume, survives restarts) ──
+UPLOAD_HISTORY_FILE = Path(os.environ.get("UPLOAD_HISTORY_FILE",
+                                          str(BASE_DIR / "data" / "upload_history.json")))
+
+
+def _load_upload_history():
+    """Return list of {upload_id, original_name, saved_name, uploaded_at, headers, row_count, source}."""
+    if not UPLOAD_HISTORY_FILE.exists():
+        return []
+    try:
+        with open(UPLOAD_HISTORY_FILE) as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, IOError):
+        return []
+
+
+def _append_upload_history(record):
+    UPLOAD_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    history = _load_upload_history()
+    history.append(record)
+    if len(history) > 200:
+        history = history[-200:]
+    try:
+        tmp = UPLOAD_HISTORY_FILE.with_suffix(".json.tmp")
+        with open(tmp, "w") as f:
+            json.dump(history, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, UPLOAD_HISTORY_FILE)
+    except (IOError, OSError):
+        pass
+
+
 # ── Excel Processing ──
 excel_columns_cache = []
 excel_rows_cache = []
 excel_path_cache = None
+excel_history_id_cache = None   # upload record id, propagated to job_data + log rows
+excel_original_name_cache = None  # original filename as uploaded by user
 
 
 @app.post("/api/upload_excel")
 async def upload_excel(file: UploadFile = File(...)):
-    global excel_columns_cache, excel_rows_cache, excel_path_cache
+    global excel_columns_cache, excel_rows_cache, excel_path_cache, excel_history_id_cache, excel_original_name_cache
 
     # Sanitize filename: strip path components to prevent path traversal
     safe_name = os.path.basename(file.filename or "upload.xlsx")
@@ -188,6 +222,20 @@ async def upload_excel(file: UploadFile = File(...)):
 
         headers = [str(h).strip() if h else f"col_{i+1}" for i, h in enumerate(rows[0])]
 
+        # Register in persistent history (survives restarts) so future sends can be
+        # traced back to the exact file the emails came from.
+        upload_id = f"{time.time_ns()}"  # nanosecond precision: unique even for same-second uploads
+        _append_upload_history({
+            "upload_id": upload_id,
+            "original_name": safe_name,
+            "saved_name": save_path.name,
+            "uploaded_at": datetime.now().isoformat(),
+            "headers": headers,
+            "row_count": len(rows) - 1,
+        })
+        excel_history_id_cache = upload_id
+        excel_original_name_cache = safe_name
+
         # Find email column
         email_col = None
         for i, h in enumerate(headers):
@@ -206,6 +254,8 @@ async def upload_excel(file: UploadFile = File(...)):
                 "row_count": len(rows) - 1,
                 "email_column": None,
                 "needs_column_select": True,
+                "source_file": safe_name,
+                "upload_id": upload_id,
             })
 
         excel_columns_cache = headers
@@ -218,6 +268,8 @@ async def upload_excel(file: UploadFile = File(...)):
             "email_column_name": headers[email_col],
             "row_count": len(rows) - 1,
             "needs_column_select": False,
+            "source_file": safe_name,
+            "upload_id": upload_id,
         })
     finally:
         wb.close()
@@ -369,6 +421,8 @@ async def start_send(
         "config": config,
         "rows": [[str(c) if c is not None else "" for c in row] for row in excel_rows_cache],
         "headers": excel_columns_cache,
+        "source_file": excel_original_name_cache or "unknown",
+        "upload_id": excel_history_id_cache or "unknown",
     }
     
     _job_thread = threading.Thread(
@@ -394,6 +448,27 @@ def _run_send_job(job_data):
     config = job_data["config"]
     rows = job_data["rows"]
     headers = job_data["headers"]
+    source_file = job_data.get("source_file", "unknown")
+    upload_id = job_data.get("upload_id", "unknown")
+
+    # Detect handle column (so log rows record it for traceability)
+    handle_col = None
+    for i, h in enumerate(headers):
+        if h.lower() in ("handle", "tiktok_handle", "tiktok handle", "username", "user_name") or "handle" in h.lower():
+            handle_col = i
+            break
+
+    def _make_log(row_no, email, ok, err, handle_val):
+        """Build a log entry that includes the source Excel filename + handle."""
+        return {
+            "row": row_no,
+            "email": str(email),
+            "handle": str(handle_val) if handle_val else "",
+            "ok": bool(ok),
+            "error": str(err) if err else "",
+            "source_file": source_file,
+            "upload_id": upload_id,
+        }
     
     total = len(rows)
     sent = 0
@@ -444,7 +519,8 @@ def _run_send_job(job_data):
 
             if not recipient or "@" not in str(recipient):
                 failed += 1
-                log.append({"row": idx + 1, "email": str(recipient), "ok": False, "error": "No valid email"})
+                log.append(_make_log(idx + 1, recipient, False, "No valid email",
+                                     row[handle_col] if handle_col is not None and handle_col < len(row) else ""))
                 _save_state({
                     "status": "running",
                     "total": total,
@@ -503,10 +579,12 @@ def _run_send_job(job_data):
 
             if ok:
                 sent += 1
-                log.append({"row": idx + 1, "email": recipient, "ok": True, "error": ""})
+                log.append(_make_log(idx + 1, recipient, True, "",
+                                     row[handle_col] if handle_col is not None and handle_col < len(row) else ""))
             else:
                 failed += 1
-                log.append({"row": idx + 1, "email": recipient, "ok": False, "error": last_err})
+                log.append(_make_log(idx + 1, recipient, False, last_err,
+                                     row[handle_col] if handle_col is not None and handle_col < len(row) else ""))
 
             _save_state({
                 "status": "running",
@@ -534,6 +612,79 @@ def _run_send_job(job_data):
         "log": log[-100:],
         "finished_at": datetime.now().isoformat(),
     })
+
+
+@app.get("/api/upload_history")
+def upload_history():
+    """Persistent history of all Excel files uploaded to this service (survives restarts)."""
+    return JSONResponse({"ok": True, "history": _load_upload_history()})
+
+
+@app.post("/api/search_excel")
+async def search_excel(request: Request):
+    """
+    Search a string across ALL uploaded Excel files (current + historical).
+    Returns: which file(s) contain that string, and the matched row data.
+    Example payload: {"query": "caryysu", "fields": ["email", "handle"]}
+    """
+    body = await request.json()
+    query = str(body.get("query", "")).strip().lower()
+    if not query:
+        return JSONResponse({"ok": False, "error": "Query empty"}, status_code=400)
+
+    results = []
+    # Search current in-memory cache first (most recent)
+    for i, row in enumerate(excel_rows_cache):
+        for j, cell in enumerate(row):
+            cell_str = str(cell).lower() if cell is not None else ""
+            if query in cell_str:
+                col_name = excel_columns_cache[j] if j < len(excel_columns_cache) else f"col_{j+1}"
+                results.append({
+                    "file": excel_original_name_cache or "current.xlsx",
+                    "upload_id": excel_history_id_cache or "",
+                    "row_no": i + 2,  # +2: 1-based + header row
+                    "matched_column": col_name,
+                    "matched_value": str(cell),
+                    "row_data": [str(c) if c is not None else "" for c in row],
+                })
+                break  # one match per row (per file)
+
+    # Search historical uploads saved to disk
+    history = _load_upload_history()
+    uploaded_names = {excel_original_name_cache, "current.xlsx"}
+    for record in history:
+        fname = record.get("saved_name", "")
+        # Avoid duplicating current cache (same file)
+        if record.get("upload_id") == excel_history_id_cache:
+            continue
+        path = UPLOAD_DIR / fname
+        if not path.exists() or fname in uploaded_names:
+            continue
+        wb = load_workbook(path, read_only=True, data_only=True)
+        try:
+            ws = wb.active
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                if i == 0:
+                    continue  # skip header
+                for j, cell in enumerate(row):
+                    cell_str = str(cell).lower() if cell is not None else ""
+                    if query in cell_str:
+                        headers_list = record.get("headers", [])
+                        col_name = headers_list[j] if j < len(headers_list) else f"col_{j+1}"
+                        results.append({
+                            "file": record.get("original_name", fname),
+                            "upload_id": record.get("upload_id", ""),
+                            "uploaded_at": record.get("uploaded_at", ""),
+                            "row_no": i + 1,
+                            "matched_column": col_name,
+                            "matched_value": str(cell),
+                            "row_data": [str(c) if c is not None else "" for c in row],
+                        })
+                        break
+        finally:
+            wb.close()
+
+    return JSONResponse({"ok": True, "query": query, "matches": results})
 
 
 @app.post("/api/stop")
@@ -745,9 +896,22 @@ input[type=file]{margin-bottom:10px}
   </div>
 </div>
 
-<!-- Step 6: Send -->
+<!-- Step 6: Source tracing (who came from which file) -->
 <div class="card">
-  <h2>6️⃣ 发送</h2>
+  <h2>6️⃣ 名单溯源 <span style="font-weight:normal;font-size:12px;color:#888;">(查询某个邮箱/handle 在哪个 Excel 文件里出现过)</span></h2>
+  <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">
+    <div style="flex:1;min-width:200px;">
+      <label>查询关键词（邮箱或 handle 片段）</label>
+      <input type="text" id="trace-query" placeholder="例如: caryysu / someone@gmail.com">
+    </div>
+    <button class="btn btn-secondary" onclick="searchTrace()">🔍 查询所有上传记录</button>
+  </div>
+  <div id="trace-results" style="margin-top:8px;"></div>
+</div>
+
+<!-- Step 7: Send -->
+<div class="card">
+  <h2>7️⃣ 发送</h2>
   <div style="display:flex;gap:10px;margin-bottom:12px;">
     <button class="btn btn-success" id="btn-send" onclick="startSend()">开始发送</button>
     <button class="btn btn-danger" id="btn-stop" onclick="stopSend()">🛑 停止</button>
@@ -1020,7 +1184,8 @@ async function uploadExcel() {
   const info = document.getElementById('excel-info');
   if (d.ok) {
     rowCount = d.row_count;
-    info.innerHTML = '✅ 共 ' + d.row_count + ' 行 · 列: ' + d.headers.join(', ');
+    currentSourceFile = d.source_file || f.name;
+    info.innerHTML = '✅ 文件 <strong>' + currentSourceFile + '</strong> · 共 ' + d.row_count + ' 行 · 列: ' + d.headers.join(', ');
     if (d.needs_column_select) {
       document.getElementById('email-col-select').style.display = 'block';
       const sel = document.getElementById('email-column');
@@ -1068,6 +1233,43 @@ async function previewVariables() {
 
 // ── Send ──
 let pollTimer = null;
+let currentSourceFile = null;  // populated on upload
+
+async function searchTrace() {
+  const q = document.getElementById('trace-query').value.trim().toLowerCase();
+  const box = document.getElementById('trace-results');
+  if (!q) { alert('请输入查询关键词'); return; }
+  box.textContent = '查询中...';
+  const d = await api('/api/search_excel', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({query: q})
+  });
+  if (!d.ok) { box.textContent = '❌ ' + (d.error || '查询失败'); return; }
+  const m = d.matches || [];
+  if (m.length === 0) {
+    box.textContent = `⚠️ 在所有已上传的 Excel 中没有找到 "${q}"`;
+    return;
+  }
+  box.textContent = '';
+  const header = document.createElement('div');
+  header.style.cssText = 'padding:6px 0;color:#6b7280;font-size:12px;border-bottom:1px solid #eee;';
+  header.textContent = `✅ 在 ${m.length} 行找到 "${q}"，来自 ${new Set(m.map(x=>x.file)).size} 个文件：`;
+  box.appendChild(header);
+  m.forEach((x) => {
+    const row = document.createElement('div');
+    row.style.cssText = 'padding:8px 0;border-bottom:1px solid #f0f0f0;font-size:12px;';
+    const parts = [];
+    parts.push('📄 ' + x.file);
+    parts.push('第 ' + x.row_no + ' 行');
+    parts.push('列「' + x.matched_column + '」= ' + x.matched_value);
+    if (x.uploaded_at) parts.push('上传于 ' + x.uploaded_at.slice(0, 16).replace('T',' '));
+    parts.forEach((p, i) => {
+      if (i > 0) row.appendChild(document.createTextNode(' · '));
+      row.appendChild(document.createTextNode(p));
+    });
+    box.appendChild(row);
+  });
+}
 
 function collectRoundParams() {
   const params = {};
@@ -1088,6 +1290,18 @@ async function startSend() {
   const testMode = document.getElementById('test-mode').checked;
   const testEmail = document.getElementById('test-email').value;
   if (testMode && !testEmail) { alert('TEST MODE 需要填写测试邮箱'); return; }
+
+  // Confirm source file + row count before sending (prevents "wrong list" accidents)
+  const fileName = currentSourceFile || '当前内存中的名单';
+  const modeLabel = testMode ? `🧪 TEST MODE（全部发往 ${testEmail}）` : '🚨 正式发送（真实收件人会收到邮件！）';
+  const ok = confirm(
+    `请仔细核对发送信息：\n\n` +
+    `📄 名单文件: ${fileName}\n` +
+    `👥 名单行数: ${rowCount} 封\n` +
+    `📮 模式: ${modeLabel}\n\n` +
+    `确认无误后点击「确定」开始发送。`
+  );
+  if (!ok) return;
   
   const body = {
     subject, html,
@@ -1150,7 +1364,11 @@ async function updateProgress() {
   log.slice(-20).forEach(e => {
     const div = document.createElement('div');
     div.className = 'log-line ' + (e.ok ? 'log-ok' : 'log-fail');
-    const parts = ['Row ' + e.row, e.email, e.ok ? '✅' : '❌ ' + (e.error || '')];
+    const parts = ['Row ' + e.row];
+    if (e.source_file) parts.push('📄 ' + e.source_file);
+    if (e.handle) parts.push('@' + e.handle);
+    parts.push(e.email);
+    parts.push(e.ok ? '✅' : '❌ ' + (e.error || ''));
     parts.forEach((p, i) => {
       if (i > 0) div.appendChild(document.createTextNode(' · '));
       div.appendChild(document.createTextNode(String(p)));
