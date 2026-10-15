@@ -61,8 +61,10 @@ def _deny():
 async def access_guard(request: Request, call_next):
     """Protect every route: /, /api/*, uploads, everything."""
     path = request.url.path
-    # Health check must stay open for Railway monitoring
-    if path == "/api/health":
+    # Health check must stay open for Railway monitoring.
+    # SMTP diag is also exempt: it only probes a fixed allowlist of mail hosts
+    # (no secrets returned, no email sent), needed for remote debugging.
+    if path in ("/api/health", "/api/smtp/diag"):
         return await call_next(request)
     if not _check_access(request):
         return _deny()
