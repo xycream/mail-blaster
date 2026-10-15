@@ -776,9 +776,42 @@ async def smtp_diag():
 
 @app.post("/api/stop")
 def stop_send():
+    """Request a graceful stop after the current email attempt finishes."""
     global _stop_flag
     _stop_flag.set()
     return JSONResponse({"ok": True, "message": "Stop requested"})
+
+
+@app.post("/api/terminate")
+def terminate_send():
+    """Terminate the current task and invalidate the cached recipient list.
+
+    This is intentionally stronger than /api/stop: after termination, a new
+    Excel upload is required before /api/send can start again. The worker checks
+    _stop_flag between emails and closes its SMTP connection in finally.
+    """
+    global _stop_flag, excel_columns_cache, excel_rows_cache, excel_path_cache
+    global excel_history_id_cache, excel_original_name_cache
+    _stop_flag.set()
+    # Invalidate the in-memory list immediately so a stale list cannot be reused.
+    excel_columns_cache = []
+    excel_rows_cache = []
+    excel_path_cache = None
+    excel_history_id_cache = None
+    excel_original_name_cache = None
+    _save_state({
+        "status": "terminated",
+        "total": 0,
+        "sent": 0,
+        "failed": 0,
+        "current_row": 0,
+        "log": [],
+        "finished_at": datetime.now().isoformat(),
+    })
+    return JSONResponse({
+        "ok": True,
+        "message": "Current task terminated; cached recipient list cleared; upload a new Excel before sending.",
+    })
 
 
 @app.get("/api/status")
@@ -1002,6 +1035,7 @@ input[type=file]{margin-bottom:10px}
   <div style="display:flex;gap:10px;margin-bottom:12px;">
     <button class="btn btn-success" id="btn-send" onclick="startSend()">开始发送</button>
     <button class="btn btn-danger" id="btn-stop" onclick="stopSend()">🛑 停止</button>
+    <button class="btn btn-danger" id="btn-terminate" onclick="terminateSend()">⛔ 终止并清空名单</button>
   </div>
   
   <div class="stats">
@@ -1404,10 +1438,36 @@ async function startSend() {
   const d = await api('/api/send', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
   if (d.ok) {
     document.getElementById('btn-send').disabled = true;
+    document.getElementById('btn-terminate').disabled = false;
     // btn-stop stays enabled always (user can stop anytime)
     startPolling();
   } else {
     alert('❌ ' + (d.error||'发送失败'));
+  }
+}
+
+async function terminateSend() {
+  const ok = confirm(
+    '确认终止当前任务并清空服务器中的名单吗？\n\n' +
+    '当前发送会停止，旧名单会立即失效。\n' +
+    '之后必须重新上传新 Excel，才能再次发送。'
+  );
+  if (!ok) return;
+  const btn = document.getElementById('btn-terminate');
+  btn.disabled = true;
+  btn.textContent = '终止中...';
+  try {
+    const d = await api('/api/terminate', {method:'POST'});
+    if (!d.ok) throw new Error(d.error || 'terminate failed');
+    document.getElementById('btn-send').disabled = true;
+    document.getElementById('excel-info').textContent = '⛔ 当前任务已终止，旧名单已清空，请重新上传 Excel';
+    btn.textContent = '已终止，请重新上传名单';
+    if (pollTimer) clearInterval(pollTimer);
+    updateProgress();
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = '⛔ 终止并清空名单';
+    alert('❌ 终止失败，请重试');
   }
 }
 
@@ -1467,6 +1527,10 @@ async function updateProgress() {
   // Status check
   if (d.status && d.status !== 'running' && d.status !== 'idle') {
     document.getElementById('btn-send').disabled = false;
+    if (d.status === 'terminated') {
+      document.getElementById('btn-send').disabled = true;
+      document.getElementById('btn-terminate').disabled = true;
+    }
     if (d.status === 'completed') {
       if (pollTimer) clearInterval(pollTimer);
     }
