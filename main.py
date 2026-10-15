@@ -150,6 +150,15 @@ _job_thread = None
 _stop_flag = threading.Event()
 
 
+def _job_alive():
+    """True only when a send worker is actually running in THIS process.
+
+    Note: _job_thread is None right after a container restart, which counts as
+    "not alive" — this is what lets stale persisted states self-heal.
+    """
+    return _job_thread is not None and _job_thread.is_alive()
+
+
 # ── SMTP Config ──
 def save_smtp_config(host, port, username, password, sender_name):
     config = {
@@ -182,6 +191,9 @@ def load_smtp_config():
 
 # ── Job State ──
 def _save_state(state):
+    # Heartbeat: lets the UI tell whether these counters are live or leftovers
+    state = dict(state)
+    state["updated_at"] = datetime.now().isoformat()
     fd, tmp = tempfile.mkstemp(dir=str(JOB_STATE_FILE.parent), suffix=".tmp")
     with os.fdopen(fd, "w") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
@@ -200,9 +212,12 @@ def _load_state():
 
 def get_state():
     s = _load_state()
-    # Check if worker is actually alive
-    if s.get("status") == "running" and _job_thread and not _job_thread.is_alive():
+    # Self-heal stale states. After a container restart/redeploy _job_thread is
+    # None, so "no thread running" must also cover the None case — otherwise a
+    # persisted 'running' state locks /api/send forever and the counters freeze.
+    if s.get("status") == "running" and not _job_alive():
         s["status"] = "interrupted"
+        s["interrupted_reason"] = "no live send worker in this process (stale state file)"
         _save_state(s)
     return s
 
@@ -1038,6 +1053,8 @@ input[type=file]{margin-bottom:10px}
     <button class="btn btn-danger" id="btn-terminate" onclick="terminateSend()">⛔ 终止并清空名单</button>
   </div>
   
+  <div id="job-context" class="hint" style="margin-bottom:6px;">当前名单：未上传　|　上次任务：无</div>
+
   <div class="stats">
     <div class="stat"><div class="num" id="stat-total">0</div><div class="label">总数</div></div>
     <div class="stat"><div class="num" id="stat-sent" style="color:#059669">0</div><div class="label">已发送</div></div>
@@ -1307,6 +1324,11 @@ async function uploadExcel() {
     rowCount = d.row_count;
     currentSourceFile = d.source_file || f.name;
     info.innerHTML = '✅ 文件 <strong>' + currentSourceFile + '</strong> · 共 ' + d.row_count + ' 行 · 列: ' + d.headers.join(', ');
+    // A fresh list is now authoritative: re-enable send and refresh the context line
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    document.getElementById('btn-send').disabled = false;
+    document.getElementById('btn-terminate').disabled = false;
+    updateJobContext({status: 'idle'});
     if (d.needs_column_select) {
       document.getElementById('email-col-select').style.display = 'block';
       const sel = document.getElementById('email-column');
@@ -1460,6 +1482,9 @@ async function terminateSend() {
     const d = await api('/api/terminate', {method:'POST'});
     if (!d.ok) throw new Error(d.error || 'terminate failed');
     document.getElementById('btn-send').disabled = true;
+    currentSourceFile = null;
+    rowCount = 0;
+    updateJobContext({status: 'terminated'});
     document.getElementById('excel-info').textContent = '⛔ 当前任务已终止，旧名单已清空，请重新上传 Excel';
     btn.textContent = '已终止，请重新上传名单';
     if (pollTimer) clearInterval(pollTimer);
@@ -1494,14 +1519,34 @@ function startPolling() {
   updateProgress();
 }
 
+// Distinguish "list currently loaded" from "counters of the last job snapshot"
+function updateJobContext(d) {
+  const box = document.getElementById('job-context');
+  if (!box) return;
+  const listPart = currentSourceFile
+    ? ('当前名单：' + currentSourceFile + ' · ' + (rowCount || 0) + ' 行')
+    : '当前名单：未上传';
+  let jobPart = '上次任务：无';
+  if (d && d.status && d.status !== 'idle') {
+    const src = (d.log && d.log[0] && d.log[0].source_file) ? d.log[0].source_file : '';
+    const when = d.updated_at ? d.updated_at.replace('T', ' ').slice(5, 16) : '';
+    jobPart = '上次任务：' + d.status + ' · 总数 ' + (d.total || 0) +
+              (src ? (' · ' + src) : '') + (when ? (' · ' + when) : '');
+  }
+  box.textContent = listPart + '　|　' + jobPart;
+}
+
 async function updateProgress() {
   const d = await api('/api/status');
-  document.getElementById('stat-total').textContent = d.total || 0;
-  document.getElementById('stat-sent').textContent = d.sent || 0;
-  document.getElementById('stat-failed').textContent = d.failed || 0;
-  document.getElementById('stat-remain').textContent = (d.total||0) - (d.sent||0) - (d.failed||0);
-  
-  const pct = d.total > 0 ? ((d.sent + d.failed) / d.total * 100) : 0;
+  // Counters below belong to the LAST job; show zeros when no job has run here
+  const stale = !d.status || d.status === 'idle' || d.status === 'terminated';
+  document.getElementById('stat-total').textContent = stale ? 0 : (d.total || 0);
+  document.getElementById('stat-sent').textContent = stale ? 0 : (d.sent || 0);
+  document.getElementById('stat-failed').textContent = stale ? 0 : (d.failed || 0);
+  document.getElementById('stat-remain').textContent = stale ? 0 : ((d.total||0) - (d.sent||0) - (d.failed||0));
+  updateJobContext(d);
+
+  const pct = (!stale && d.total > 0) ? ((d.sent + d.failed) / d.total * 100) : 0;
   document.getElementById('progress-fill').style.width = pct + '%';
   
   // Log (use textContent via DOM construction to avoid XSS from email/error fields)
