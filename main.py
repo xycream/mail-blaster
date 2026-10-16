@@ -986,6 +986,7 @@ input[type=file]{margin-bottom:10px}
 <!-- Step 4: Email Content -->
 <div class="card">
   <h2>4️⃣ 邮件内容 (HTML)</h2>
+  <button class="btn btn-secondary" style="float:right;padding:4px 10px;font-size:12px;" onclick="clearDraft()">清空本地草稿</button>
   <label>邮件主题</label>
   <input type="text" id="subject" placeholder="Hi {handle}, TikTok Shop product opportunities from Liveology US" value="Hi {handle}, TikTok Shop product opportunities from Liveology US">
   <p class="hint">
@@ -1145,7 +1146,64 @@ const editor = CodeMirror.fromTextArea(document.getElementById('html-editor'), {
     'Tab': cm => cm.replaceSelection('  ', 'end')
   }
 });
-editor.setValue(DEFAULT_HTML);
+// Persist editable campaign fields locally so a page refresh does not erase work.
+// Excel files are intentionally NOT persisted in localStorage; re-upload the list after refresh.
+const DRAFT_STORAGE_KEY = 'mail_blaster_draft_v1';
+const DRAFT_FIELD_IDS = [
+  'subject', 'rp-category_type', 'rp-brand_name', 'rp-product_url',
+  'rp-picture_url', 'rp-product_price', 'test-email', 'min-delay',
+  'max-delay', 'smtp-name'
+];
+function saveDraft() {
+  try {
+    const draft = { html: editor.getValue(), saved_at: new Date().toISOString() };
+    DRAFT_FIELD_IDS.forEach(id => {
+      const el = document.getElementById(id);
+      if (el) draft[id] = el.type === 'checkbox' ? el.checked : el.value;
+    });
+    const testMode = document.getElementById('test-mode');
+    if (testMode) draft['test-mode'] = testMode.checked;
+    localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(draft));
+  } catch (e) { console.warn('Draft save failed:', e); }
+}
+function restoreDraft() {
+  try {
+    const raw = localStorage.getItem(DRAFT_STORAGE_KEY);
+    if (!raw) { editor.setValue(DEFAULT_HTML); return; }
+    const draft = JSON.parse(raw);
+    editor.setValue(draft.html || DEFAULT_HTML);
+    DRAFT_FIELD_IDS.forEach(id => {
+      const el = document.getElementById(id);
+      if (!el || draft[id] === undefined) return;
+      if (el.type === 'checkbox') el.checked = !!draft[id];
+      else el.value = draft[id];
+    });
+    const testMode = document.getElementById('test-mode');
+    if (testMode && draft['test-mode'] !== undefined) testMode.checked = !!draft['test-mode'];
+    if (testMode) document.getElementById('test-email-box').style.display = testMode.checked ? 'block' : 'none';
+  } catch (e) {
+    console.warn('Draft restore failed:', e);
+    editor.setValue(DEFAULT_HTML);
+  }
+}
+function clearDraft() {
+  localStorage.removeItem(DRAFT_STORAGE_KEY);
+  editor.setValue(DEFAULT_HTML);
+  DRAFT_FIELD_IDS.forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+  document.getElementById('subject').value = 'Hi {handle}, TikTok Shop product opportunities from Liveology US';
+  document.getElementById('min-delay').value = 2;
+  document.getElementById('max-delay').value = 10;
+  document.getElementById('test-mode').checked = true;
+  document.getElementById('test-email-box').style.display = 'block';
+}
+restoreDraft();
+editor.on('change', saveDraft);
+DRAFT_FIELD_IDS.forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('input', saveDraft);
+});
+const testModeDraft = document.getElementById('test-mode');
+if (testModeDraft) testModeDraft.addEventListener('change', saveDraft);
 
 // Tab switching
 let currentTab = 'code';
