@@ -23,7 +23,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Response, RedirectResponse
 from openpyxl import load_workbook
 
 app = FastAPI(title="Mail Blaster")
@@ -64,7 +64,7 @@ async def access_guard(request: Request, call_next):
     # Health check must stay open for Railway monitoring.
     # SMTP diag is also exempt: it only probes a fixed allowlist of mail hosts
     # (no secrets returned, no email sent), needed for remote debugging.
-    if path in ("/api/health", "/api/smtp/diag"):
+    if path in ("/api/health", "/api/smtp/diag", "/api/google/oauth/callback"):
         return await call_next(request)
     if not _check_access(request):
         return _deny()
@@ -391,12 +391,19 @@ def smtp_status():
 
 
 @app.get("/api/health")
-def health():
+def health(request: Request):
     """Health check endpoint for Railway / monitoring."""
     config = load_smtp_config()
+    store = _google_load_tokens()
     return JSONResponse({
         "status": "ok",
+        "build_sha": os.environ.get("RAILWAY_GIT_COMMIT_SHA", "local")[:7],
         "smtp_configured": config is not None,
+        # Gmail-draft mode readiness
+        "google_client_configured": bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET),
+        "google_authorized": bool(store and store.get("refresh_token")),
+        "google_account": store.get("email", "") if store else "",
+        "google_oauth_redirect_uri": _google_redirect_uri(request),
         "upload_dir": str(UPLOAD_DIR),
         "platform": os.environ.get("RAILWAY_ENVIRONMENT", "local"),
     })
@@ -835,6 +842,453 @@ def status():
     return JSONResponse(s)
 
 
+# ── Gmail Drafts via Google API (compose-only: this app never calls .send) ──
+#
+# Strategy change (2026-10-19): instead of SMTP-blasting emails, build one Gmail
+# DRAFT per Excel row and let a human hit "Send" in the Gmail UI. The OAuth scope
+# requested is gmail.compose only.
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_SCOPES = os.environ.get(
+    "GOOGLE_SCOPES", "https://www.googleapis.com/auth/gmail.compose")
+GOOGLE_TOKEN_FILE = Path(os.environ.get(
+    "GOOGLE_TOKEN_FILE", str(BASE_DIR / "data" / "google_tokens.json")))
+GOOGLE_DRAFT_LEDGER = Path(os.environ.get(
+    "GOOGLE_DRAFT_LEDGER", str(BASE_DIR / "data" / "draft_ledger.json")))
+GOOGLE_AUTH_BASE = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
+GOOGLE_API_BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+
+
+def _google_redirect_uri(request: Request):
+    """Callback URL sent to Google; must byte-match the Google Console setting.
+
+    Railway terminates TLS at its edge and forwards http:// to the container, so
+    request.base_url alone would produce an http:// redirect_uri that Google
+    rejects. Honour the forwarded protocol/host, or an explicit override.
+    """
+    if PUBLIC_BASE_URL:
+        return f"{PUBLIC_BASE_URL}/api/google/oauth/callback"
+    base = str(request.base_url).rstrip("/")
+    fwd_proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    fwd_host = request.headers.get("x-forwarded-host", "").split(",")[0].strip()
+    if fwd_proto in ("http", "https"):
+        from urllib.parse import urlparse
+
+        netloc = fwd_host or urlparse(base).netloc
+        base = f"{fwd_proto}://{netloc}"
+    return f"{base}/api/google/oauth/callback"
+
+
+def _google_load_tokens():
+    if not GOOGLE_TOKEN_FILE.exists():
+        return None
+    try:
+        with open(GOOGLE_TOKEN_FILE) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return None
+
+
+def _google_save_tokens(store):
+    GOOGLE_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = GOOGLE_TOKEN_FILE.with_suffix(".json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(store, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, GOOGLE_TOKEN_FILE)
+
+
+def _google_http_json(url, method="GET", payload=None, token=None, form=None, timeout=40):
+    """Minimal JSON/form HTTP client on stdlib urllib (no extra dependency)."""
+    import urllib.request
+    import urllib.error
+    import urllib.parse
+
+    headers = {"Content-Type": "application/json; charset=utf-8"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if form is not None:
+        data = urllib.parse.urlencode(form).encode()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    else:
+        data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode()), None
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read().decode())
+        except Exception:
+            body = {"error": {"message": str(e)}}
+        return body, f"HTTP {e.code}: {body.get('error', {}).get('message', str(e))}"
+    except Exception as e:
+        return {}, f"{type(e).__name__}: {e}"
+
+
+def _google_access_token():
+    """Return (access_token, error). Refreshes the stored token when needed."""
+    store = _google_load_tokens()
+    if not store or not store.get("refresh_token"):
+        return None, "尚未完成 Google 授权（请在页面上点击「连接 Gmail 授权」）"
+    now = time.time()
+    if store.get("access_token") and store.get("expires_at", 0) - 60 > now:
+        return store["access_token"], None
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        return None, "GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET 未配置"
+    resp, err = _google_http_json(
+        GOOGLE_TOKEN_URI, method="POST",
+        form={
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "grant_type": "refresh_token",
+            "refresh_token": store["refresh_token"],
+        })
+    if err:
+        return None, f"token 刷新失败: {err}"
+    store["access_token"] = resp.get("access_token")
+    store["expires_at"] = now + int(resp.get("expires_in", 3600))
+    _google_save_tokens(store)
+    return store["access_token"], None
+
+
+def _google_account_email():
+    store = _google_load_tokens() or {}
+    return store.get("email") or ""
+
+
+def _load_draft_ledger():
+    """upload_id -> set of row numbers that already have a draft, for dedupe."""
+    if not GOOGLE_DRAFT_LEDGER.exists():
+        return {}
+    try:
+        with open(GOOGLE_DRAFT_LEDGER) as f:
+            data = json.load(f)
+        return {k: set(v) for k, v in data.items()}
+    except (json.JSONDecodeError, IOError):
+        return {}
+
+
+def _save_draft_ledger(ledger):
+    GOOGLE_DRAFT_LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        tmp = GOOGLE_DRAFT_LEDGER.with_suffix(".json.tmp")
+        with open(tmp, "w") as f:
+            json.dump({k: sorted(v) for k, v in ledger.items()}, f, indent=2)
+        os.replace(tmp, GOOGLE_DRAFT_LEDGER)
+    except (IOError, OSError):
+        pass
+
+
+def _render_email_row(subject, html_body, row, headers, round_params, recipient):
+    """Apply round-level fixed params, then per-row Excel variables."""
+    import re
+
+    out_subject = subject
+    out_html = html_body
+    for rp_name, rp_val in (round_params or {}).items():
+        rp_val = "" if rp_val is None else str(rp_val)
+        out_subject = out_subject.replace("{" + rp_name + "}", rp_val)
+        out_html = out_html.replace("{" + rp_name + "}", rp_val)
+    variables = {h: (row[i] if i < len(row) else "") for i, h in enumerate(headers)}
+    for var_name, var_val in variables.items():
+        out_subject = out_subject.replace("{" + var_name + "}", str(var_val))
+        out_html = out_html.replace("{" + var_name + "}", str(var_val))
+    if "{name}" in out_html and "name" not in headers:
+        out_html = out_html.replace("{name}", str(recipient).split("@")[0])
+    if "{name}" in out_subject and "name" not in headers:
+        out_subject = out_subject.replace("{name}", str(recipient).split("@")[0])
+    return out_subject, out_html
+
+
+def _gmail_create_draft(token, to_addr, subject, html, from_name, cc_addr=None):
+    """Create a Gmail draft (users.drafts.create). Returns (draft_id, error)."""
+    import base64
+
+    msg = EmailMessage()
+    if from_name:
+        msg["From"] = formataddr((from_name, _google_account_email() or "me"))
+    else:
+        msg["From"] = _google_account_email() or "me"
+    msg["To"] = to_addr
+    if cc_addr:
+        msg["Cc"] = cc_addr
+    msg["Subject"] = subject
+    msg.set_content("Please enable HTML to view this email.")
+    msg.add_alternative(html, subtype="html")
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    resp, err = _google_http_json(
+        f"{GOOGLE_API_BASE}/drafts", method="POST", payload={"raw": raw}, token=token)
+    if err:
+        return None, err
+    return resp.get("id"), None
+
+
+_draft_thread = None
+_draft_stop = threading.Event()
+_draft_state = {"status": "idle", "total": 0, "created": 0, "skipped": 0,
+                "failed": 0, "current_row": 0, "log": []}
+
+
+def _draft_alive():
+    return _draft_thread is not None and _draft_thread.is_alive()
+
+
+def _save_draft_state(state):
+    state["updated_at"] = datetime.now().isoformat()
+    global _draft_state
+    _draft_state = state
+
+
+def _get_draft_state():
+    if _draft_alive():
+        return _draft_state
+    if _draft_state.get("status") == "running":
+        _draft_state["status"] = "interrupted"
+    return _draft_state
+
+
+@app.get("/api/google/status")
+def google_status(request: Request):
+    store = _google_load_tokens()
+    return JSONResponse({
+        "ok": True,
+        "client_configured": bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET),
+        "authorized": bool(store and store.get("refresh_token")),
+        "email": _google_account_email(),
+        "scope": (store or {}).get("scope", ""),
+        "redirect_uri": _google_redirect_uri(request),
+        "token_file": str(GOOGLE_TOKEN_FILE),
+        # Only this scope is requested; the app never calls drafts.send.
+        "compose_only": "gmail.compose" in (store or {}).get("scope", ""),
+    })
+
+
+@app.get("/api/google/connect")
+def google_connect(request: Request):
+    """Start Google OAuth. Requires the sender account to consent once."""
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        return JSONResponse({"ok": False, "error": "GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET 未配置"}, status_code=400)
+    from urllib.parse import urlencode
+
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": _google_redirect_uri(request),
+        "scope": GOOGLE_SCOPES,
+        "response_type": "code",
+        "access_type": "offline",       # needed for a refresh token
+        "prompt": "consent",            # force refresh token even if previously granted
+        "include_granted_scopes": "true",
+    }
+    return RedirectResponse(f"{GOOGLE_AUTH_BASE}?{urlencode(params)}")
+
+
+@app.get("/api/google/oauth/callback")
+async def google_oauth_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+    if error:
+        return HTMLResponse(f"<h3>❌ Google 授权被拒绝</h3><p>{error}</p>")
+    if not code:
+        return HTMLResponse("<h3>❌ 缺少 code 参数</h3>", status_code=400)
+    resp, err = _google_http_json(
+        GOOGLE_TOKEN_URI, method="POST",
+        form={
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "code": code,
+            "grant_type": "authorization_code",
+            "redirect_uri": _google_redirect_uri(request),
+        })
+    if err:
+        return HTMLResponse(
+            f"<h3>❌ 授权失败</h3><p>{err}</p>"
+            f"<p style='color:#888'>常见原因：redirect_uri 与 Google Console 登记值不一致"
+            f"（当前使用 {_google_redirect_uri(request)}）</p>", status_code=400)
+    # Decode the email/scope from the id_token without signature verification
+    # (display-only; the API calls themselves are authenticated by the token).
+    email, scope = "", resp.get("scope", "")
+    try:
+        import base64 as _b64
+
+        idt = resp.get("id_token", "")
+        if idt:
+            payload = idt.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            email = json.loads(_b64.urlsafe_b64decode(payload)).get("email", "")
+    except Exception:
+        pass
+    _google_save_tokens({
+        "access_token": resp.get("access_token"),
+        "refresh_token": resp.get("refresh_token"),
+        "expires_at": time.time() + int(resp.get("expires_in", 3600)),
+        "scope": scope,
+        "email": email,
+        "authorized_at": datetime.now().isoformat(),
+    })
+    return HTMLResponse(
+        "<h3>✅ Google 授权成功，已保存 token</h3>"
+        f"<p>账号：{email or '（未返回邮箱，不影响使用）'}</p>"
+        f"<p>权限：{scope}</p>"
+        "<p><a href='/'>← 返回 Mail Blaster</a></p>")
+
+
+@app.post("/api/create_drafts")
+async def start_create_drafts(request: Request):
+    """Queue a draft-creation job. Creates Gmail drafts only -- sends nothing."""
+    global _draft_thread, _draft_stop
+
+    body = await request.json()
+    subject = body.get("subject", "")
+    html_body = body.get("html", "")
+    email_col = int(body.get("email_column", 0))
+    from_name = body.get("from_name", "")
+    round_params = body.get("round_params", {}) or {}
+    limit = int(body.get("limit", 0) or 0)          # 0 = all remaining
+    delay_sec = float(body.get("delay_sec", 1.0))   # polite pacing for the API
+    skip_sent = bool(body.get("skip_existing", True))
+
+    if not excel_rows_cache:
+        return JSONResponse({"ok": False, "error": "未上传 Excel 名单"}, status_code=400)
+    if _draft_alive():
+        return JSONResponse({"ok": False, "error": "已有草稿任务在运行"}, status_code=409)
+    token, terr = _google_access_token()
+    if not token:
+        return JSONResponse({"ok": False, "error": terr}, status_code=400)
+    if not subject.strip():
+        return JSONResponse({"ok": False, "error": "邮件主题为空"}, status_code=400)
+
+    upload_id = excel_history_id_cache or "unknown"
+    ledger = _load_draft_ledger()
+    done_rows = ledger.get(upload_id, set()) if skip_existing else set()
+
+    job_data = {
+        "subject": subject,
+        "html": html_body,
+        "email_col": email_col,
+        "from_name": from_name,
+        "round_params": round_params,
+        "rows": [[str(c) if c is not None else "" for c in row] for row in excel_rows_cache],
+        "headers": excel_columns_cache,
+        "source_file": excel_original_name_cache or "unknown",
+        "upload_id": upload_id,
+        "limit": limit,
+        "delay_sec": delay_sec,
+        "done_rows": done_rows,
+    }
+
+    _draft_stop.clear()
+    _draft_thread = threading.Thread(target=_run_draft_job, args=(job_data,), daemon=True)
+    _draft_thread.start()
+    return JSONResponse({"ok": True, "total": len(job_data["rows"]),
+                         "skipped_existing": len(done_rows),
+                         "source_file": job_data["source_file"]})
+
+
+def _run_draft_job(job_data):
+    subject = job_data["subject"]
+    html_body = job_data["html"]
+    email_col = job_data["email_col"]
+    from_name = job_data["from_name"]
+    round_params = job_data["round_params"]
+    rows = job_data["rows"]
+    headers = job_data["headers"]
+    source_file = job_data["source_file"]
+    upload_id = job_data["upload_id"]
+    limit = job_data["limit"]
+    delay_sec = job_data["delay_sec"]
+
+    ledger = _load_draft_ledger()
+    created_ids = ledger.setdefault(f"{upload_id}:ids", [])
+    done = ledger.get(upload_id, set())
+
+    handle_col = None
+    for i, h in enumerate(headers):
+        hl = h.lower()
+        if "handle" in hl or hl in ("username", "user_name"):
+            handle_col = i
+            break
+
+    total = len(rows)
+    created = skipped = failed = 0
+    log = []
+    _save_draft_state({"status": "running", "total": total, "created": 0,
+                       "skipped": 0, "failed": 0, "current_row": 0, "log": [],
+                       "source_file": source_file,
+                       "started_at": datetime.now().isoformat()})
+    try:
+        for idx, row in enumerate(rows):
+            if _draft_stop.is_set():
+                break
+            if limit and created >= limit:
+                break
+            recipient = row[email_col] if email_col < len(row) else ""
+            row_no = idx + 1
+            handle_val = row[handle_col] if handle_col is not None and handle_col < len(row) else ""
+
+            entry = {"row": row_no, "email": str(recipient),
+                     "handle": str(handle_val or ""),
+                     "source_file": source_file, "upload_id": upload_id}
+            if not recipient or "@" not in str(recipient):
+                failed += 1
+                log.append({**entry, "ok": False, "error": "No valid email"})
+            elif row_no in done:
+                skipped += 1
+                log.append({**entry, "ok": True, "error": "", "note": "已存在草稿，跳过"})
+            else:
+                subj, body_html = _render_email_row(
+                    subject, html_body, row, headers, round_params, recipient)
+                token, terr = _google_access_token()
+                if not token:
+                    failed += 1
+                    log.append({**entry, "ok": False, "error": f"token: {terr}"})
+                else:
+                    draft_id, derr = _gmail_create_draft(
+                        token, str(recipient), subj, body_html, from_name)
+                    if derr:
+                        failed += 1
+                        log.append({**entry, "ok": False, "error": derr})
+                    else:
+                        created += 1
+                        done.add(row_no)
+                        ledger[upload_id] = done
+                        if draft_id:
+                            created_ids.append(draft_id)
+                        _save_draft_ledger(ledger)
+                        log.append({**entry, "ok": True, "error": "", "draft_id": draft_id})
+            _save_draft_state({"status": "running", "total": total, "created": created,
+                               "skipped": skipped, "failed": failed,
+                               "current_row": row_no, "log": log[-100:],
+                               "source_file": source_file})
+            if delay_sec > 0 and not _draft_stop.is_set():
+                time.sleep(delay_sec)
+    finally:
+        _save_draft_ledger(ledger)
+
+    final = "completed" if not _draft_stop.is_set() else "stopped"
+    _save_draft_state({"status": final, "total": total, "created": created,
+                       "skipped": skipped, "failed": failed, "current_row": total,
+                       "log": log[-100:], "source_file": source_file,
+                       "finished_at": datetime.now().isoformat()})
+
+
+@app.get("/api/draft_status")
+def draft_status():
+    return JSONResponse(_get_draft_state())
+
+
+@app.post("/api/draft_stop")
+def draft_stop():
+    _draft_stop.set()
+    return JSONResponse({"ok": True, "message": "Stop requested"})
+
+
+@app.get("/api/draft_ledger")
+def draft_ledger():
+    ledger = {k: (sorted(v) if isinstance(v, set) else v) for k, v in _load_draft_ledger().items()}
+    return JSONResponse({"ok": True, "ledger": ledger})
+
+
 # ── Frontend ──
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -1032,6 +1486,34 @@ input[type=file]{margin-bottom:10px}
   </div>
 </div>
 
+<!-- Step 5.5: Gmail Draft mode (human clicks Send in Gmail) -->
+<div class="card" id="draft-card" style="border-left:4px solid #059669;">
+  <h2>📤 Gmail 草稿模式（推荐：程序只做草稿，你人工点发送）</h2>
+  <div id="google-status" style="margin-bottom:10px;font-size:13px;"></div>
+  <div style="margin-bottom:12px;">
+    <button class="btn btn-secondary" onclick="window.open('/api/google/connect','_blank')">连接 Gmail 授权（一次性）</button>
+    <a class="btn btn-secondary" href="https://mail.google.com/mail/u/0/#drafts" target="_blank">打开 Gmail 草稿箱</a>
+  </div>
+  <div class="grid2">
+    <div><label>本次创建数量（0 = 全部剩余）</label><input type="number" id="draft-limit" value="20"></div>
+    <div><label>每封间隔 (秒)</label><input type="number" id="draft-delay" value="1" step="0.1"></div>
+  </div>
+  <label><input type="checkbox" id="draft-skip-existing" checked style="width:auto;margin-right:6px;">跳过已创建过草稿的行（防止重复草稿）</label>
+  <div style="margin-top:12px;">
+    <button class="btn btn-primary" id="btn-drafts" onclick="startDrafts()">📝 创建 Gmail 草稿</button>
+    <button class="btn btn-danger" id="btn-draft-stop" onclick="stopDrafts()" disabled>停止</button>
+    <span id="draft-note" style="font-size:12px;color:#888;margin-left:8px;">此操作只是把邮件写入草稿箱，不会发出任何邮件</span>
+  </div>
+  <div class="stats" style="margin-top:12px;">
+    <div class="stat"><div class="num" id="dstat-created" style="color:#059669">0</div><div class="label">已建草稿</div></div>
+    <div class="stat"><div class="num" id="dstat-skipped">0</div><div class="label">跳过</div></div>
+    <div class="stat"><div class="num" id="dstat-failed" style="color:#dc2626">0</div><div class="label">失败</div></div>
+    <div class="stat"><div class="num" id="dstat-row">0</div><div class="label">当前行</div></div>
+  </div>
+  <div class="progress-bar"><div class="progress-fill" id="draft-progress" style="width:0%"></div></div>
+  <div class="log-box" id="draft-log"><div class="log-line" style="color:#999;">等待创建草稿...</div></div>
+</div>
+
 <!-- Step 6: Source tracing (who came from which file) -->
 <div class="card">
   <h2>6️⃣ 名单溯源 <span style="font-weight:normal;font-size:12px;color:#888;">(查询某个邮箱/handle 在哪个 Excel 文件里出现过)</span></h2>
@@ -1152,7 +1634,7 @@ const DRAFT_STORAGE_KEY = 'mail_blaster_draft_v1';
 const DRAFT_FIELD_IDS = [
   'subject', 'rp-category_type', 'rp-brand_name', 'rp-product_url',
   'rp-picture_url', 'rp-product_price', 'test-email', 'min-delay',
-  'max-delay', 'smtp-name'
+  'max-delay', 'smtp-name', 'draft-limit', 'draft-delay'
 ];
 function saveDraft() {
   try {
@@ -1655,9 +2137,118 @@ window.addEventListener('beforeunload', function(e) {
   }
 });
 
+// ── Gmail Draft mode ──
+let draftPollTimer = null;
+
+async function checkGoogle() {
+  const el = document.getElementById('google-status');
+  try {
+    const d = await api('/api/google/status');
+    if (!d.client_configured) {
+      el.innerHTML = '<span class="badge badge-no">❌ Google 凭据未配置</span> 请在 Railway 设置 GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET';
+      return;
+    }
+    if (d.authorized) {
+      el.innerHTML = '<span class="badge badge-ok">✅ 已授权 Gmail（只读草稿权限）</span> 账号: ' +
+        (d.email || '(未返回)') + (d.compose_only ? ' · 权限: gmail.compose（程序无发信权限调用）' : '');
+    } else {
+      el.innerHTML = '<span class="badge badge-no">⚠️ 尚未授权</span> 点上方「连接 Gmail 授权」，用发件账号（liveology.ny@gmail.com）登录并同意，一次即可';
+    }
+  } catch (e) {
+    el.innerHTML = '<span class="badge badge-no">❌ 无法获取 Google 授权状态</span> ' + e.message;
+  }
+}
+
+async function startDrafts() {
+  const subject = document.getElementById('subject').value;
+  const html = getEditorHtml();
+  if (!subject) { alert('请填写邮件主题'); return; }
+  if (!html || !html.trim()) { alert('请填写邮件正文'); return; }
+  if (emailColIdx === null) { alert('请先上传 Excel 并选择邮箱列'); return; }
+  const limit = parseInt(document.getElementById('draft-limit').value || '0', 10);
+  const ok = confirm(
+    `将创建 Gmail 草稿（不会发送任何邮件）：\n\n` +
+    `文件：${currentSourceFile || '未知'}\n` +
+    `名单：${rowCount} 行\n` +
+    `本次数量：${limit > 0 ? limit : '全部剩余'}\n` +
+    `跳过已创建：${document.getElementById('draft-skip-existing').checked ? '是' : '否'}\n\n` +
+    `确认继续？`);
+  if (!ok) return;
+  const d = await api('/api/create_drafts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      subject: subject,
+      html: html,
+      email_column: emailColIdx,
+      from_name: document.getElementById('smtp-name').value,
+      round_params: collectRoundParams(),
+      limit: limit,
+      delay_sec: parseFloat(document.getElementById('draft-delay').value || '1'),
+      skip_existing: document.getElementById('draft-skip-existing').checked,
+    }),
+  });
+  if (!d.ok) { alert('❌ ' + (d.error || '启动失败')); return; }
+  document.getElementById('btn-drafts').disabled = true;
+  document.getElementById('btn-draft-stop').disabled = false;
+  pollDraftStatus(true);
+}
+
+async function stopDrafts() {
+  await api('/api/draft_stop', { method: 'POST' });
+  document.getElementById('draft-log').innerHTML +=
+    '<div class="log-line" style="color:#f59e0b">⏹ 已请求停止...</div>';
+}
+
+function renderDraftStatus(d) {
+  document.getElementById('dstat-created').textContent = d.created || 0;
+  document.getElementById('dstat-skipped').textContent = d.skipped || 0;
+  document.getElementById('dstat-failed').textContent = d.failed || 0;
+  document.getElementById('dstat-row').textContent = d.current_row || 0;
+  const total = d.total || 0;
+  const pct = total ? Math.min(100, Math.round(((d.current_row || 0) / total) * 100)) : 0;
+  document.getElementById('draft-progress').style.width = pct + '%';
+  const box = document.getElementById('draft-log');
+  box.innerHTML = (d.log || []).slice(-40).map(l => {
+    if (l.ok) {
+      return `<div class="log-line" style="color:#059669">✅ 第${l.row}行 ${l.email} ${l.note || ''} 草稿ID:${l.draft_id || '-'}</div>`;
+    }
+    return `<div class="log-line" style="color:#dc2626">❌ 第${l.row}行 ${l.email || '?'} · ${l.error || ''}</div>`;
+  }).join('') || '<div class="log-line" style="color:#999">等待创建草稿...</div>';
+  box.scrollTop = box.scrollHeight;
+}
+
+function pollDraftStatus(start) {
+  if (draftPollTimer) clearInterval(draftPollTimer);
+  const tick = async () => {
+    try {
+      const d = await api('/api/draft_status');
+      renderDraftStatus(d);
+      if (d.status === 'running') {
+        document.getElementById('btn-drafts').disabled = true;
+        document.getElementById('btn-draft-stop').disabled = false;
+        // Survive a page refresh mid-job: re-arm polling when a job is live.
+        if (!draftPollTimer) draftPollTimer = setInterval(tick, 1500);
+      } else {
+        if (draftPollTimer) { clearInterval(draftPollTimer); draftPollTimer = null; }
+        document.getElementById('btn-drafts').disabled = false;
+        document.getElementById('btn-draft-stop').disabled = true;
+        if (d.created || d.failed) {
+          document.getElementById('draft-log').innerHTML +=
+            `<div class="log-line" style="color:#059669;font-weight:600">■ 任务${d.status === 'stopped' ? '已停止' : '完成'}：成功 ${d.created || 0} 封草稿，跳过 ${d.skipped || 0}，失败 ${d.failed || 0}。去 Gmail 草稿箱人工核对后点击发送。</div>`;
+        }
+      }
+    } catch (e) { /* transient */ }
+  };
+  tick();
+  if (start) draftPollTimer = setInterval(tick, 1500);
+}
+
 // ── Init ──
 checkSMTP();
+checkGoogle();
 updateProgress();
+pollDraftStatus(false);
 </script>
 </body>
 </html>
