@@ -84,6 +84,13 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # SMTP config: prefer environment variables (Railway-safe), fall back to local file
 SMTP_CONFIG_FILE = BASE_DIR / ".smtp_config.json"
+
+# Instance identity. One codebase runs as several Railway services (e.g. the
+# personal Gmail and a Workspace mailbox). Without a loud on-screen label an
+# operator can upload a list to the wrong instance and burn it -- so the label
+# and the real sending account are surfaced in the header and every confirm box.
+INSTANCE_LABEL = os.environ.get("INSTANCE_LABEL", "Mail Blaster")
+INSTANCE_COLOR = os.environ.get("INSTANCE_COLOR", "#2563eb")
 JOB_STATE_FILE = Path(os.environ.get("JOB_STATE_FILE", str(BASE_DIR / "data" / "job_state.json")))
 JOB_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
@@ -403,6 +410,10 @@ def health(request: Request):
     store = _google_load_tokens()
     return JSONResponse({
         "status": "ok",
+        # Which mailbox this deployment talks to. Two Railway services share this
+        # codebase, so ops must be able to tell them apart from outside.
+        "instance_label": INSTANCE_LABEL,
+        "sender": config.get("username", "") if config else "",
         "build_sha": os.environ.get("RAILWAY_GIT_COMMIT_SHA", "local")[:7],
         # boot_at / uptime_seconds prove whether a fresh container really started.
         # Without them, "google_client_configured=false" is ambiguous: it could mean
@@ -1481,7 +1492,11 @@ def draft_ledger():
 # ── Frontend ──
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return FRONTEND_HTML
+    # Instance label/color come from env so one codebase can look visibly
+    # different per mailbox (personal vs Workspace) and avoid operator mixups.
+    return (FRONTEND_HTML
+            .replace("__INSTANCE_LABEL__", INSTANCE_LABEL)
+            .replace("__INSTANCE_COLOR__", INSTANCE_COLOR))
 
 
 FRONTEND_HTML = r"""<!DOCTYPE html>
@@ -1489,7 +1504,7 @@ FRONTEND_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Mail Blaster — 批量个性化邮件发送</title>
+<title>__INSTANCE_LABEL__ — 批量个性化邮件发送</title>
 <!-- CodeMirror — HTML code editor with syntax highlighting -->
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/material-darker.min.css">
@@ -1503,7 +1518,7 @@ FRONTEND_HTML = r"""<!DOCTYPE html>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;color:#333;font-size:14px}
-.header{background:#1a73e8;color:#fff;padding:16px 24px;display:flex;align-items:center;justify-content:space-between}
+.header{background:__INSTANCE_COLOR__;color:#fff;padding:16px 24px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}
 .header h1{font-size:20px;font-weight:600}
 .container{max-width:900px;margin:0 auto;padding:20px}
 .card{background:#fff;border-radius:8px;padding:20px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,0.08)}
@@ -1561,8 +1576,12 @@ input[type=file]{margin-bottom:10px}
 <body>
 
 <div class="header">
-  <h1>📧 Mail Blaster</h1>
+  <h1>📧 __INSTANCE_LABEL__</h1>
   <span style="font-size:13px;opacity:0.9">批量个性化邮件发送 · 随机间隔防垃圾</span>
+  <div id="instance-badge" style="margin-top:8px;display:inline-block;padding:4px 12px;border-radius:999px;
+       background:rgba(255,255,255,0.18);border:1px solid rgba(255,255,255,0.45);font-size:13px;font-weight:600;">
+    发信账号加载中…
+  </div>
 </div>
 
 <div class="container">
@@ -2011,9 +2030,18 @@ async function api(path, opts={}) {
 }
 
 // ── SMTP ──
+let smtpAccount = '';   // real sending address of THIS instance, shown everywhere
+
 async function checkSMTP() {
   const d = await api('/api/smtp/status');
   const el = document.getElementById('smtp-status');
+  const badge = document.getElementById('instance-badge');
+  smtpAccount = d.configured ? d.username : '';
+  if (badge) {
+    badge.textContent = d.configured
+      ? ('📮 本实例发信账号：' + d.username)
+      : '⚠️ 尚未配置发信账号';
+  }
   if (d.configured) {
     el.innerHTML = '<span class="badge badge-ok">✅ 已配置</span> ' + d.host + ':' + d.port + ' (' + d.username + ')' +
       (d.sender_name ? ' · ' + d.sender_name : '');
@@ -2172,6 +2200,8 @@ async function startSend() {
   const modeLabel = testMode ? `🧪 TEST MODE（全部发往 ${testEmail}）` : '🚨 正式发送（真实收件人会收到邮件！）';
   const ok = confirm(
     `请仔细核对发送信息：\n\n` +
+    `🏷 实例: __INSTANCE_LABEL__\n` +
+    `📮 发信账号: ${smtpAccount || '未配置'}\n` +
     `📄 名单文件: ${fileName}\n` +
     `👥 名单行数: ${rowCount} 封\n` +
     `📮 模式: ${modeLabel}\n\n` +
@@ -2373,6 +2403,8 @@ async function startDrafts() {
   const limit = parseInt(document.getElementById('draft-limit').value || '0', 10);
   const ok = confirm(
     `将创建 Gmail 草稿（不会发送任何邮件）：\n\n` +
+    `🏷 实例: __INSTANCE_LABEL__\n` +
+    `📮 草稿写入账号: ${smtpAccount || '未配置'}\n` +
     `文件：${currentSourceFile || '未知'}\n` +
     `名单：${rowCount} 行\n` +
     `本次数量：${limit > 0 ? limit : '全部剩余'}\n` +
