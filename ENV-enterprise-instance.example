@@ -1,0 +1,41 @@
+# ─────────────────────────────────────────────────────────────
+# 企业邮箱实例（Google Workspace）的 Railway 变量模板
+#
+# 用途：在 Railway 上给 xycream/mail-blaster 复制出第二个 service，
+#       把这些键值逐条填进该 service 的 Variables（环境选 Production）。
+#
+# ⚠️ 这个文件只是模板，不含真实密码；不要把真实的 App Password 提交到 Git。
+# ⚠️ 与个人邮箱实例的关系：同一个仓库、同一套代码，两个 service 各自读自己的
+#    环境变量和各自的 Volume，名单/日志/草稿台账完全隔离，互不覆盖。
+# ─────────────────────────────────────────────────────────────
+
+# ── 发信凭据（企业邮箱）────────────────────────────────────────
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=465
+SMTP_USERNAME=allyinfo@myliveology.org
+SMTP_PASSWORD=<16 位应用专用密码，去掉空格>
+
+# ── 草稿通道：IMAP 写入 Gmail 草稿箱（不需要 Google OAuth）──────
+DRAFT_BACKEND=imap
+IMAP_HOST=imap.gmail.com
+IMAP_PORT=993
+
+# ── 实例标识（必须和个人实例不同，防止把名单传到错误的邮箱）──────
+INSTANCE_LABEL=Liveology 企业邮箱
+INSTANCE_COLOR=#7c3aed
+
+# ── 持久化路径（配合挂到 /app/data 的 Volume，否则重新部署会丢）──
+UPLOAD_DIR=/app/data/uploads
+JOB_STATE_FILE=/app/data/job_state.json
+UPLOAD_HISTORY_FILE=/app/data/upload_history.json
+GOOGLE_TOKEN_FILE=/app/data/google_tokens.json
+GOOGLE_DRAFT_LEDGER=/app/data/draft_ledger.json
+
+# ── 网页访问密码（强烈建议；留空 = 任何拿到域名的人都能进后台）──
+APP_PASSWORD=<自定义，只发给实际操作的人>
+
+# ── 可选：只有需要「Gmail API 草稿」备用通道时才填 ───────────────
+# 当前企业实例走 IMAP，不需要以下三项
+# GOOGLE_CLIENT_ID=
+# GOOGLE_CLIENT_SECRET=
+# PUBLIC_BASE_URL=https://<本实例的 Railway 域名>

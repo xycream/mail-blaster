@@ -125,6 +125,16 @@ GET https://<新域名>/api/draft_backend
 | 登录 Gmail 时被要求验证/账号受限 | 新邮箱批量行为触发风控 | 降低每日量、加预热；不要短时间大量发 |
 | 草稿箱里看不到 | 登错账号（个人 Gmail 也有一个实例） | 看顶栏标识 + Gmail 右上角头像确认账号 |
 
+## 7. 已实测结论（2026-10-19，`allyinfo@myliveology.org`）
+
+用线上同一份代码直接对该企业邮箱跑过，结果：
+
+- IMAP 登录成功：`allyinfo@myliveology.org authenticated (Success)`
+- **注意：该邮箱界面语言是中文，IMAP 里草稿箱名是 `[Gmail]/&g0l6Pw-`（"草稿" 的
+  modified-UTF7 编码），不是 `[Gmail]/Drafts`。** 代码按 LIST 的 `\Drafts` 属性动态
+  解析文件夹名，因此自动兼容，无需配置；遇到其它语言界面同样适用。
+- APPEND 写入成功，读回确认带 `\Draft` 标志、From/To/Subject 与 HTML 正文完整
+
 ---
 
 ## 附：个人实例要不要也补 `INSTANCE_LABEL`
