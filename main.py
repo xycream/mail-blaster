@@ -72,6 +72,11 @@ async def access_guard(request: Request, call_next):
 
 BASE_DIR = Path(__file__).parent
 
+# Container start time, for /api/health: lets us tell whether a redeploy actually
+# happened after Railway variables were edited.
+_BOOT_TS = time.time()
+_BOOT_AT = datetime.now().isoformat(timespec="seconds")
+
 # Use Railway persistent volume if mounted, otherwise local directory
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", str(BASE_DIR / "uploads")))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -398,9 +403,21 @@ def health(request: Request):
     return JSONResponse({
         "status": "ok",
         "build_sha": os.environ.get("RAILWAY_GIT_COMMIT_SHA", "local")[:7],
+        # boot_at / uptime_seconds prove whether a fresh container really started.
+        # Without them, "google_client_configured=false" is ambiguous: it could mean
+        # the variables were added but never redeployed, or that they landed in the
+        # Preview environment / under a mistyped name and the new container cannot
+        # see them at all.
+        "boot_at": _BOOT_AT,
+        "uptime_seconds": int(time.time() - _BOOT_TS),
         "smtp_configured": config is not None,
         # Gmail-draft mode readiness
         "google_client_configured": bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET),
+        "google_env_present": {
+            "GOOGLE_CLIENT_ID": bool(os.environ.get("GOOGLE_CLIENT_ID")),
+            "GOOGLE_CLIENT_SECRET": bool(os.environ.get("GOOGLE_CLIENT_SECRET")),
+            "PUBLIC_BASE_URL": bool(os.environ.get("PUBLIC_BASE_URL")),
+        },
         "google_authorized": bool(store and store.get("refresh_token")),
         "google_account": store.get("email", "") if store else "",
         "google_oauth_redirect_uri": _google_redirect_uri(request),
