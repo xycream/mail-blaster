@@ -849,6 +849,19 @@ def status():
 # requested is gmail.compose only.
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+# Local-dev fallback: the downloaded Cloud Console client secret JSON.
+# This path is git-ignored (secrets/); on Railway the env vars above are used.
+GOOGLE_CLIENT_SECRET_FILE = Path(os.environ.get(
+    "GOOGLE_CLIENT_SECRET_FILE", str(BASE_DIR / "secrets" / "google_client_secret.json")))
+if not GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET_FILE.exists():
+    try:
+        with open(GOOGLE_CLIENT_SECRET_FILE) as _f:
+            _gconf = json.load(_f)
+        _gweb = _gconf.get("web") or _gconf.get("installed") or {}
+        GOOGLE_CLIENT_ID = _gweb.get("client_id", "")
+        GOOGLE_CLIENT_SECRET = GOOGLE_CLIENT_SECRET or _gweb.get("client_secret", "")
+    except (json.JSONDecodeError, IOError):
+        pass
 GOOGLE_SCOPES = os.environ.get(
     "GOOGLE_SCOPES", "https://www.googleapis.com/auth/gmail.compose")
 GOOGLE_TOKEN_FILE = Path(os.environ.get(

@@ -24,3 +24,7 @@ data/
 .vscode/
 .idea/
 .DS_Store
+
+# Google OAuth client secret (downloaded from Cloud Console) — NEVER commit
+secrets/
+*.client_secret.json
