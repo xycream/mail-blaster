@@ -12,13 +12,14 @@ Features:
 
 import os
 import json
+import re
 import smtplib
 import random
 import time
 import tempfile
 import threading
 from email.message import EmailMessage
-from email.utils import formataddr
+from email.utils import formataddr, formatdate
 from datetime import datetime
 from pathlib import Path
 
@@ -1056,6 +1057,102 @@ def _gmail_create_draft(token, to_addr, subject, html, from_name, cc_addr=None):
     return resp.get("id"), None
 
 
+# ── IMAP draft backend (uses the existing App Password; no Google OAuth at all) ──
+#
+# Preferred path: gmail.compose is a Google "Restricted" scope, and OAuth in
+# Testing mode needs the mailbox added as a test user plus a 7-day token refresh.
+# APPEND over IMAP writes straight into the mailbox's Drafts folder with the
+# \Draft flag using the same App Password already used for SMTP, so a human can
+# open the draft in Gmail and click Send. Nothing is transmitted here.
+IMAP_HOST = os.environ.get("IMAP_HOST", "imap.gmail.com")
+IMAP_PORT = int(os.environ.get("IMAP_PORT", "993"))
+DRAFT_BACKEND = os.environ.get("DRAFT_BACKEND", "imap")  # imap | google_api
+
+
+class _ImapDraftWriter:
+    """One reused IMAP connection for a whole batch.
+
+    Gmail throttles datacenter IPs that reconnect + login repeatedly (this bit us
+    on the SMTP path), so the connection stays open across rows and is only
+    re-established when a command actually fails.
+    """
+
+    def __init__(self, username, password):
+        self.username = username
+        self.password = password
+        self.conn = None
+        self.mailbox = None
+
+    def _connect(self):
+        import imaplib
+
+        conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, timeout=120)
+        conn.login(self.username, self.password)
+        # The Drafts folder name is locale-dependent ("[Gmail]/Drafts" vs a
+        # translated name), so resolve it from the LIST attributes.
+        mbox = None
+        typ, items = conn.list()
+        if typ == "OK":
+            for it in items or []:
+                line = it.decode(errors="replace") if isinstance(it, bytes) else str(it)
+                if "\\Drafts" not in line:
+                    continue
+                # Shape: (\HasNoChildren \Drafts) "/" "[Gmail]/Drafts"
+                # -- the mailbox name is the last quoted or bare token.
+                m = re.search(r'"([^"]*)"\s+(\S.*)$', line)
+                if m:
+                    mbox = m.group(2).strip().strip('"')
+                else:
+                    mbox = line.rsplit(")", 1)[-1].strip().strip('"')
+                if mbox:
+                    break
+        if not mbox:
+            raise RuntimeError("该邮箱没有 Drafts 文件夹（请确认已开启 IMAP）")
+        self.conn, self.mailbox = conn, mbox
+
+    def _reset(self):
+        try:
+            if self.conn:
+                self.conn.logout()
+        except Exception:
+            pass
+        self.conn = self.mailbox = None
+
+    def append(self, to_addr, subject, html, from_name, cc_addr=None):
+        msg = EmailMessage()
+        sender = self.username
+        msg["From"] = formataddr((from_name, sender)) if from_name else sender
+        msg["To"] = to_addr
+        if cc_addr:
+            msg["Cc"] = cc_addr
+        msg["Subject"] = subject
+        msg["Date"] = formatdate(localtime=True)
+        msg.set_content("Please enable HTML to view this email.")
+        msg.add_alternative(html, subtype="html")
+        raw = msg.as_bytes()
+
+        last_err = None
+        for attempt in range(3):
+            try:
+                if not self.conn:
+                    self._connect()
+                quoted = (f'"{self.mailbox}"'
+                          if (" " in self.mailbox or "[" in self.mailbox)
+                          else self.mailbox)
+                # imaplib formats the INTERNALDATE itself, but only accepts an
+                # int / struct_time / tz-aware datetime, so pass the latter.
+                typ, data = self.conn.append(
+                    quoted, "(\\Draft \\Seen)", datetime.now().astimezone(), raw)
+                if typ == "OK":
+                    return True, None
+                last_err = f"IMAP APPEND 返回 {typ}: {data}"
+                self._reset()          # connection likely stale; rebuild it
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"
+                self._reset()
+        return False, last_err
+
+
 _draft_thread = None
 _draft_stop = threading.Event()
 _draft_state = {"status": "idle", "total": 0, "created": 0, "skipped": 0,
@@ -1176,17 +1273,28 @@ async def start_create_drafts(request: Request):
     round_params = body.get("round_params", {}) or {}
     limit = int(body.get("limit", 0) or 0)          # 0 = all remaining
     delay_sec = float(body.get("delay_sec", 1.0))   # polite pacing for the API
-    skip_sent = bool(body.get("skip_existing", True))
+    skip_existing = bool(body.get("skip_existing", True))
 
     if not excel_rows_cache:
         return JSONResponse({"ok": False, "error": "未上传 Excel 名单"}, status_code=400)
     if _draft_alive():
         return JSONResponse({"ok": False, "error": "已有草稿任务在运行"}, status_code=409)
-    token, terr = _google_access_token()
-    if not token:
-        return JSONResponse({"ok": False, "error": terr}, status_code=400)
     if not subject.strip():
         return JSONResponse({"ok": False, "error": "邮件主题为空"}, status_code=400)
+
+    backend = (body.get("backend") or DRAFT_BACKEND or "imap").lower()
+    imap_cfg = None
+    if backend == "imap":
+        # Reuses the SMTP App Password; no Google OAuth involved at all.
+        imap_cfg = load_smtp_config()
+        if not imap_cfg or not imap_cfg.get("username") or not imap_cfg.get("password"):
+            return JSONResponse({"ok": False,
+                                 "error": "IMAP 草稿需要 SMTP 凭据：请先在上方填写并保存 SMTP（App Password）"},
+                                status_code=400)
+    else:
+        token, terr = _google_access_token()
+        if not token:
+            return JSONResponse({"ok": False, "error": terr}, status_code=400)
 
     upload_id = excel_history_id_cache or "unknown"
     ledger = _load_draft_ledger()
@@ -1205,6 +1313,8 @@ async def start_create_drafts(request: Request):
         "limit": limit,
         "delay_sec": delay_sec,
         "done_rows": done_rows,
+        "backend": backend,
+        "imap_cfg": imap_cfg,
     }
 
     _draft_stop.clear()
@@ -1212,6 +1322,7 @@ async def start_create_drafts(request: Request):
     _draft_thread.start()
     return JSONResponse({"ok": True, "total": len(job_data["rows"]),
                          "skipped_existing": len(done_rows),
+                         "backend": backend,
                          "source_file": job_data["source_file"]})
 
 
@@ -1242,9 +1353,14 @@ def _run_draft_job(job_data):
     total = len(rows)
     created = skipped = failed = 0
     log = []
+    backend = job_data.get("backend", "imap")
+    imap_writer = None
+    if backend == "imap":
+        cfg = job_data.get("imap_cfg") or load_smtp_config()
+        imap_writer = _ImapDraftWriter(cfg["username"], cfg["password"])
     _save_draft_state({"status": "running", "total": total, "created": 0,
                        "skipped": 0, "failed": 0, "current_row": 0, "log": [],
-                       "source_file": source_file,
+                       "source_file": source_file, "backend": backend,
                        "started_at": datetime.now().isoformat()})
     try:
         for idx, row in enumerate(rows):
@@ -1268,24 +1384,39 @@ def _run_draft_job(job_data):
             else:
                 subj, body_html = _render_email_row(
                     subject, html_body, row, headers, round_params, recipient)
-                token, terr = _google_access_token()
-                if not token:
-                    failed += 1
-                    log.append({**entry, "ok": False, "error": f"token: {terr}"})
-                else:
-                    draft_id, derr = _gmail_create_draft(
-                        token, str(recipient), subj, body_html, from_name)
-                    if derr:
+                if backend == "imap":
+                    ok2, ierr = imap_writer.append(
+                        str(recipient), subj, body_html, from_name)
+                    if not ok2:
                         failed += 1
-                        log.append({**entry, "ok": False, "error": derr})
+                        log.append({**entry, "ok": False, "error": ierr})
                     else:
                         created += 1
                         done.add(row_no)
                         ledger[upload_id] = done
-                        if draft_id:
-                            created_ids.append(draft_id)
                         _save_draft_ledger(ledger)
-                        log.append({**entry, "ok": True, "error": "", "draft_id": draft_id})
+                        log.append({**entry, "ok": True, "error": "",
+                                    "note": "已写入草稿箱"})
+                else:
+                    token, terr = _google_access_token()
+                    if not token:
+                        failed += 1
+                        log.append({**entry, "ok": False, "error": f"token: {terr}"})
+                    else:
+                        draft_id, derr = _gmail_create_draft(
+                            token, str(recipient), subj, body_html, from_name)
+                        if derr:
+                            failed += 1
+                            log.append({**entry, "ok": False, "error": derr})
+                        else:
+                            created += 1
+                            done.add(row_no)
+                            ledger[upload_id] = done
+                            if draft_id:
+                                created_ids.append(draft_id)
+                            _save_draft_ledger(ledger)
+                            log.append({**entry, "ok": True, "error": "",
+                                        "draft_id": draft_id})
             _save_draft_state({"status": "running", "total": total, "created": created,
                                "skipped": skipped, "failed": failed,
                                "current_row": row_no, "log": log[-100:],
@@ -1294,12 +1425,40 @@ def _run_draft_job(job_data):
                 time.sleep(delay_sec)
     finally:
         _save_draft_ledger(ledger)
+        if imap_writer:
+            imap_writer._reset()   # release the IMAP connection
 
     final = "completed" if not _draft_stop.is_set() else "stopped"
     _save_draft_state({"status": final, "total": total, "created": created,
                        "skipped": skipped, "failed": failed, "current_row": total,
                        "log": log[-100:], "source_file": source_file,
+                       "backend": backend,
                        "finished_at": datetime.now().isoformat()})
+
+
+@app.get("/api/draft_backend")
+def draft_backend(request: Request):
+    """Which draft channel is usable right now, so the UI can pick defaults."""
+    store = _google_load_tokens()
+    smtp_cfg = load_smtp_config()
+    imap_ready = bool(smtp_cfg and smtp_cfg.get("username") and smtp_cfg.get("password"))
+    google_ready = bool(store and store.get("refresh_token"))
+    return JSONResponse({
+        "ok": True,
+        "default": DRAFT_BACKEND,
+        "imap": {
+            "ready": imap_ready,
+            "account": smtp_cfg.get("username", "") if smtp_cfg else "",
+            "host": f"{IMAP_HOST}:{IMAP_PORT}",
+            # No OAuth, no test users, no 7-day expiry -- same App Password as SMTP.
+            "needs_login": False,
+        },
+        "google_api": {
+            "ready": google_ready,
+            "client_configured": bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET),
+            "account": _google_account_email(),
+        },
+    })
 
 
 @app.get("/api/draft_status")
@@ -1518,10 +1677,14 @@ input[type=file]{margin-bottom:10px}
 
 <!-- Step 5.5: Gmail Draft mode (human clicks Send in Gmail) -->
 <div class="card" id="draft-card" style="border-left:4px solid #059669;">
-  <h2>📤 Gmail 草稿模式（推荐：程序只做草稿，你人工点发送）</h2>
+  <h2>📤 Gmail 草稿模式（程序只写草稿，你人工点发送）</h2>
   <div id="google-status" style="margin-bottom:10px;font-size:13px;"></div>
-  <div style="margin-bottom:12px;">
-    <button class="btn btn-secondary" onclick="window.open('/api/google/connect','_blank')">连接 Gmail 授权（一次性）</button>
+  <div style="margin-bottom:10px;">
+    <label style="margin-right:16px;"><input type="radio" name="draft-backend" value="imap" checked style="width:auto;margin-right:5px;">IMAP 写草稿（推荐：用现有 App Password，无需 Google 授权）</label>
+    <label><input type="radio" name="draft-backend" value="google_api" style="width:auto;margin-right:5px;">Gmail API（需一次性 Google 授权）</label>
+  </div>
+  <div id="lark-connect-btn" style="margin-bottom:12px;">
+    <button class="btn btn-secondary" onclick="window.open('/api/google/connect','_blank')">连接 Gmail 授权（仅 Gmail API 方式需要）</button>
     <a class="btn btn-secondary" href="https://mail.google.com/mail/u/0/#drafts" target="_blank">打开 Gmail 草稿箱</a>
   </div>
   <div class="grid2">
@@ -2173,20 +2336,32 @@ let draftPollTimer = null;
 async function checkGoogle() {
   const el = document.getElementById('google-status');
   try {
-    const d = await api('/api/google/status');
-    if (!d.client_configured) {
-      el.innerHTML = '<span class="badge badge-no">❌ Google 凭据未配置</span> 请在 Railway 设置 GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET';
-      return;
-    }
-    if (d.authorized) {
-      el.innerHTML = '<span class="badge badge-ok">✅ 已授权 Gmail（只读草稿权限）</span> 账号: ' +
-        (d.email || '(未返回)') + (d.compose_only ? ' · 权限: gmail.compose（程序无发信权限调用）' : '');
+    const b = await api('/api/draft_backend');
+    const lines = [];
+    if (b.imap && b.imap.ready) {
+      lines.push('<span class="badge badge-ok">✅ IMAP 草稿可用</span> 账号 ' + b.imap.account +
+        ' · 用现有 App Password，无需 Google 授权');
     } else {
-      el.innerHTML = '<span class="badge badge-no">⚠️ 尚未授权</span> 点上方「连接 Gmail 授权」，用发件账号（liveology.ny@gmail.com）登录并同意，一次即可';
+      lines.push('<span class="badge badge-no">⚠️ IMAP 草稿不可用</span> 请先在上方「发信配置」保存 SMTP（App Password）');
     }
+    if (b.google_api && b.google_api.ready) {
+      lines.push('<br><span class="badge badge-ok">✅ Gmail API 已授权</span> ' + (b.google_api.account || ''));
+    } else {
+      lines.push('<br><span style="font-size:12px;color:#888;">Gmail API 方式未授权（可忽略，默认走 IMAP）</span>');
+    }
+    el.innerHTML = lines.join('');
+    // Default the radio to whichever channel actually works.
+    const radios = document.getElementsByName('draft-backend');
+    if (b.imap && b.imap.ready) { radios[0].checked = true; }
+    else if (b.google_api && b.google_api.ready) { radios[1].checked = true; }
   } catch (e) {
-    el.innerHTML = '<span class="badge badge-no">❌ 无法获取 Google 授权状态</span> ' + e.message;
+    el.innerHTML = '<span class="badge badge-no">❌ 无法获取草稿通道状态</span> ' + e.message;
   }
+}
+
+function selectedDraftBackend() {
+  const r = document.querySelector('input[name="draft-backend"]:checked');
+  return r ? r.value : 'imap';
 }
 
 async function startDrafts() {
@@ -2216,6 +2391,7 @@ async function startDrafts() {
       limit: limit,
       delay_sec: parseFloat(document.getElementById('draft-delay').value || '1'),
       skip_existing: document.getElementById('draft-skip-existing').checked,
+      backend: selectedDraftBackend(),
     }),
   });
   if (!d.ok) { alert('❌ ' + (d.error || '启动失败')); return; }
