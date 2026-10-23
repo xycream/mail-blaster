@@ -1494,9 +1494,40 @@ def draft_ledger():
 def index():
     # Instance label/color come from env so one codebase can look visibly
     # different per mailbox (personal vs Workspace) and avoid operator mixups.
+    product_fields = '''  <div class="grid2">
+    <div>
+      <label>产品链接 <span class="snippet">{product_url}</span></label>
+      <input type="text" id="rp-product_url" placeholder="Taplink / TikTok Shop 产品页 / 官网链接">
+    </div>
+  </div>'''
+    product_block = '''<!-- 产品链接 -->
+<p style="margin:0 0 24px 0;text-align:center;">
+  <a href="{product_url}" style="color:#0066cc;text-decoration:underline;font-size:15px;">🔗 View the product</a>
+</p>'''
+    if INSTANCE_LABEL == "Liveology 企业邮箱":
+        product_fields = '''  <div class="grid2">
+    <div>
+      <label>产品链接 1 <span class="snippet">{product_url}</span></label>
+      <input type="text" id="rp-product_url" placeholder="第一个产品链接：TikTok Shop / 官网 / Taplink">
+    </div>
+    <div>
+      <label>产品链接 2 <span class="snippet">{product_url_2}</span></label>
+      <input type="text" id="rp-product_url_2" placeholder="第二个产品链接：TikTok Shop / 官网 / Taplink">
+    </div>
+  </div>'''
+        product_block = '''<!-- 产品链接（两个产品） -->
+<p style="margin:0 0 12px 0;font-size:14px;color:#000000;font-weight:bold;">
+  <span style="display:inline-block;width:4px;height:14px;background:#1a73e8;vertical-align:middle;margin-right:8px;border-radius:2px;"></span>Choose a product to explore
+</p>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 24px 0;">
+  <tr><td align="left" style="padding:4px 0;"><a href="{product_url}" target="_blank" rel="noopener" style="display:inline-block;background:#f1f3f4;color:#1a73e8;padding:9px 18px;border-radius:20px;text-decoration:none;font-size:14px;font-weight:600;">Product 1</a></td></tr>
+  <tr><td align="left" style="padding:4px 0;"><a href="{product_url_2}" target="_blank" rel="noopener" style="display:inline-block;background:#f1f3f4;color:#1a73e8;padding:9px 18px;border-radius:20px;text-decoration:none;font-size:14px;font-weight:600;">Product 2</a></td></tr>
+</table>'''
     return (FRONTEND_HTML
             .replace("__INSTANCE_LABEL__", INSTANCE_LABEL)
-            .replace("__INSTANCE_COLOR__", INSTANCE_COLOR))
+            .replace("__INSTANCE_COLOR__", INSTANCE_COLOR)
+            .replace("__PRODUCT_LINK_FIELDS__", product_fields)
+            .replace("__PRODUCT_LINK_BLOCK__", product_block))
 
 
 FRONTEND_HTML = r"""<!DOCTYPE html>
@@ -1629,11 +1660,8 @@ input[type=file]{margin-bottom:10px}
       <input type="text" id="rp-brand_name" placeholder="例如: Eufy">
     </div>
   </div>
+__PRODUCT_LINK_FIELDS__
   <div class="grid2">
-    <div>
-      <label>产品链接 <span class="snippet">{product_url}</span></label>
-      <input type="text" id="rp-product_url" placeholder="Taplink / TikTok Shop 产品页 / 官网链接">
-    </div>
     <div>
       <label>产品价格 <span class="snippet">{product_price}</span></label>
       <input type="text" id="rp-product_price" placeholder="例如: $199">
@@ -1781,10 +1809,7 @@ const DEFAULT_HTML = `<html>
   <img src="{picture_url}" alt="{category_type}" style="display:block;max-width:100%;width:100%;height:auto;border-radius:10px;border:1px solid #f0f0f0;">
 </p>
 
-<!-- 产品链接 -->
-<p style="margin:0 0 24px 0;text-align:center;">
-  <a href="{product_url}" style="color:#0066cc;text-decoration:underline;font-size:15px;">🔗 View the product</a>
-</p>
+__PRODUCT_LINK_BLOCK__
 
 <!-- 核心 Benefit 词组区 -->
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:20px;">
@@ -1844,7 +1869,7 @@ const editor = CodeMirror.fromTextArea(document.getElementById('html-editor'), {
 // Excel files are intentionally NOT persisted in localStorage; re-upload the list after refresh.
 const DRAFT_STORAGE_KEY = 'mail_blaster_draft_v1';
 const DRAFT_FIELD_IDS = [
-  'subject', 'rp-category_type', 'rp-brand_name', 'rp-product_url',
+  'subject', 'rp-category_type', 'rp-brand_name', 'rp-product_url', 'rp-product_url_2',
   'rp-picture_url', 'rp-product_price', 'test-email', 'min-delay',
   'max-delay', 'smtp-name', 'draft-limit', 'draft-delay'
 ];
@@ -2177,7 +2202,7 @@ async function searchTrace() {
 
 function collectRoundParams() {
   const params = {};
-  ['category_type', 'brand_name', 'product_url', 'picture_url', 'product_price'].forEach(key => {
+  ['category_type', 'brand_name', 'product_url', 'product_url_2', 'picture_url', 'product_price'].forEach(key => {
     const el = document.getElementById('rp-' + key);
     if (el && el.value.trim()) params[key] = el.value.trim();
   });
