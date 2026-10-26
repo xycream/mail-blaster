@@ -91,6 +91,10 @@ SMTP_CONFIG_FILE = BASE_DIR / ".smtp_config.json"
 # and the real sending account are surfaced in the header and every confirm box.
 INSTANCE_LABEL = os.environ.get("INSTANCE_LABEL", "Mail Blaster")
 INSTANCE_COLOR = os.environ.get("INSTANCE_COLOR", "#2563eb")
+# Product link slots: 1 = single {product_url} (personal-instance behaviour),
+# 2 = {product_url} + {product_url_2} dual buttons. 0 = auto (dual only for the
+# legacy allyinfo instance whose label matches; keeps old deployments identical).
+PRODUCT_LINKS = int(os.environ.get("PRODUCT_LINKS", "0") or 0)
 JOB_STATE_FILE = Path(os.environ.get("JOB_STATE_FILE", str(BASE_DIR / "data" / "job_state.json")))
 JOB_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1504,7 +1508,11 @@ def index():
 <p style="margin:0 0 24px 0;text-align:center;">
   <a href="{product_url}" style="color:#0066cc;text-decoration:underline;font-size:15px;">🔗 View the product</a>
 </p>'''
-    if INSTANCE_LABEL == "Liveology 企业邮箱":
+    # Two product links are opt-in per deployment via PRODUCT_LINKS (env).
+    # Back-compat: the first enterprise instance (allyinfo) has no PRODUCT_LINKS
+    # variable but its label IS "Liveology 企业邮箱", so keep that old check too.
+    dual = PRODUCT_LINKS == 2 or (PRODUCT_LINKS == 0 and INSTANCE_LABEL == "Liveology 企业邮箱")
+    if dual:
         product_fields = '''  <div class="grid2">
     <div>
       <label>产品链接 1 <span class="snippet">{product_url}</span></label>
