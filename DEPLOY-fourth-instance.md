@@ -1,4 +1,4 @@
-# 第四个发信实例部署指南（luna03@myliveology.org · Google Workspace）
+# 第四个发信实例部署指南（luna@myliveology.org · Google Workspace）
 
 与 luna04 完全相同的模式：同一套代码（`xycream/mail-blaster`，分支
 `enterprise-two-product-links`）在 Railway 起**第四个独立服务**。四个实例互不影响，
@@ -9,7 +9,7 @@
 | 个人邮箱 | `liveology.ny@gmail.com` | `liveologyus.up.railway.app` | Mail Blaster | 蓝 #1a73e8 |
 | 企业 A | `allyinfo@myliveology.org` | `mail-blaster-copy-production.up.railway.app` | Liveology 企业邮箱 | 紫 #7c3aed |
 | 企业 B | `luna04@myliveology.org` | `mail-blaster-copy-copy-production.up.railway.app` | Liveology 企业邮箱 · Luna04 | 青绿 #0d9488 |
-| **企业 C（本指南）** | `luna03@myliveology.org` | 新建服务自动生成 | Liveology 企业邮箱 · Luna03 | 橙 #d97706 |
+| **企业 C（本指南）** | `luna@myliveology.org` | 新建服务自动生成 | Liveology 企业邮箱 · Luna | 橙 #d97706 |
 
 工作方式与其它实例相同：**读 Excel → IMAP 写草稿 → 人工在 Gmail 点发送**。
 程序不发信、不需要 Google OAuth。
@@ -18,10 +18,10 @@
 
 ## 0. 前置条件（账号本人）
 
-同域策略已放行（allyinfo / luna04 已走通），只需 `luna03@myliveology.org` 本人：
+同域策略已放行（allyinfo / luna04 已走通），只需 `luna@myliveology.org` 本人：
 
 1. 开两步验证：👉 https://myaccount.google.com/signinoptions/two-step-verification
-2. 生成应用专用密码（App 选 Mail，设备名建议 `Railway Mail Blaster luna03`）：
+2. 生成应用专用密码（App 选 Mail，设备名建议 `Railway Mail Blaster luna`）：
    👉 https://myaccount.google.com/apppasswords
 3. 拿到 16 位 App Password（填变量时去掉空格）。
 
@@ -45,14 +45,14 @@
 ```env
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=465
-SMTP_USERNAME=luna03@myliveology.org
-SMTP_PASSWORD=<luna03 的 16 位 App Password，去掉空格>
+SMTP_USERNAME=luna@myliveology.org
+SMTP_PASSWORD=<luna 的 16 位 App Password，去掉空格>
 
 DRAFT_BACKEND=imap
 IMAP_HOST=imap.gmail.com
 IMAP_PORT=993
 
-INSTANCE_LABEL=Liveology 企业邮箱 · Luna03
+INSTANCE_LABEL=Liveology 企业邮箱 · Luna
 INSTANCE_COLOR=#d97706
 
 PRODUCT_LINKS=2
@@ -79,13 +79,13 @@ APP_PASSWORD=<自定义网页访问密码，只发给实际操作的人>
 ```
 GET /api/health
   → build_sha: 1370852（或更新）
-  → instance_label: Liveology 企业邮箱 · Luna03
-  → sender: luna03@myliveology.org
+  → instance_label: Liveology 企业邮箱 · Luna
+  → sender: luna@myliveology.org
   → smtp_configured: true
   → upload_dir: /app/data/uploads
 ```
 
-然后用 1 行测试名单跑 1 封草稿（收件人写 luna03 自己），在 Gmail 草稿箱核对
+然后用 1 行测试名单跑 1 封草稿（收件人写 luna 自己），在 Gmail 草稿箱核对
 （👉 https://mail.google.com/mail/u/0/#drafts）双按钮与变量替换无误，再上真实名单。
 
 ## 4. 安全与纪律（同其它实例）
